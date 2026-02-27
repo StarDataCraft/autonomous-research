@@ -1,5 +1,6 @@
 import streamlit as st
 from cue_rules import classify_cue_sentence, is_limitation_failure
+from cue_rules import is_limitation_failure
 
 from research_agent import (
     HypothesisSpec,
@@ -353,7 +354,36 @@ with tab_main:
             # 핵심 수정: contradictions ONLY from limitation/failure cues
             st.markdown("### C) Limitations / failure signals (from cue-hit; filtered)")
             raw = list(report.contradictions or [])
-            only_limits = [s for s in raw if _is_limitation_failure_sentence(s)]
+
+            # 핵심 수정: contradictions ONLY from limitation/failure cues (robust rule)
+            st.markdown("### C) Limitations / failure signals (from cue-hit; filtered)")
+            raw = list(report.contradictions or [])
+            
+            def _strip_title_suffix(x: str) -> str:
+                """
+                report.contradictions entries are often like:
+                  "<sentence>  — *<title>*"
+                We only want to classify the sentence part.
+                """
+                x = (x or "").strip()
+                if "—" in x:
+                    x = x.split("—", 1)[0].strip()
+                return x
+            
+            only_limits = [s for s in raw if is_limitation_failure(_strip_title_suffix(s))]
+            
+            if not only_limits:
+                st.info(
+                    "没有检测到明显的 Limitation/Failure 句（基于两段式规则过滤）。"
+                    "这通常意味着：本轮 cue-hit 里更多是 framing / claim 句，而不是问题句。"
+                )
+                with st.expander("Show raw contradiction candidates (debug)"):
+                    for s in raw[: min(30, len(raw))]:
+                        st.write("• " + s)
+            else:
+                for s in only_limits:
+                    st.write("• " + s)
+        
             if not only_limits:
                 st.info(
                     "没有检测到明显的 Limitation/Failure 句（基于规则过滤）。"
