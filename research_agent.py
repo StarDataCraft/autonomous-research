@@ -12,16 +12,12 @@ from prompts import (
 )
 from utils import bulletify, trim_block
 
-# Try importing OpenAI safely
+# Optional OpenAI integration
 try:
-    from openai import OpenAI
+    from openai import OpenAI  # type: ignore
 except Exception:
     OpenAI = None
 
-
-# ===============================
-# Data structure
-# ===============================
 
 @dataclass
 class HypothesisSpec:
@@ -39,20 +35,27 @@ class HypothesisSpec:
 def get_openai_key() -> str | None:
     """
     Priority:
-    1. Streamlit Cloud secrets
-    2. Environment variable
+    1) Streamlit Cloud secrets
+    2) Environment variable
     """
-    # Streamlit Cloud
     key = st.secrets.get("OPENAI_API_KEY", None)
     if key:
         return key
-
-    # Environment variable
     key = os.getenv("OPENAI_API_KEY")
     if key:
         return key
-
     return None
+
+
+def get_model_name() -> str:
+    """
+    Optional model override via secrets/env.
+    """
+    return (
+        st.secrets.get("OPENAI_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or "gpt-4.1-mini"
+    )
 
 
 def llm_available() -> bool:
@@ -60,28 +63,29 @@ def llm_available() -> bool:
 
 
 # ===============================
-# LLM Call
+# OpenAI call
 # ===============================
 
 def _call_openai(system: str, user: str) -> str:
     api_key = get_openai_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found in st.secrets or environment variable.")
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed. Add `openai` to requirements.txt.")
 
-    if not api_key or OpenAI is None:
-        raise RuntimeError("OpenAI not available.")
-
+    model = get_model_name()
     client = OpenAI(api_key=api_key)
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+    resp = client.chat.completions.create(
+        model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         temperature=0.2,
-        max_tokens=1200,
+        max_tokens=1400,
     )
-
-    return response.choices[0].message.content or ""
+    return resp.choices[0].message.content or ""
 
 
 # ===============================
@@ -116,12 +120,7 @@ def _spec_block(spec: HypothesisSpec, context: str = "") -> str:
 # Literature Compression
 # ===============================
 
-def run_literature_compression(
-    spec: HypothesisSpec,
-    context: str = "",
-    use_llm: bool = False,
-) -> str:
-
+def run_literature_compression(spec: HypothesisSpec, context: str = "", use_llm: bool = False) -> str:
     spec_txt = _spec_block(spec, context=context)
 
     if use_llm and llm_available():
@@ -129,31 +128,39 @@ def run_literature_compression(
             return _call_openai(
                 system="You are a meticulous research assistant. Be precise and structured.",
                 user=PROMPT_LIT_COMPRESSION.format(spec=spec_txt),
-            )
-        except Exception:
-            pass  # fallback
+            ).strip()
+        except Exception as e:
+            # ✅ Show real error instead of silently falling back
+            return trim_block(
+                f"""
+                ## LLM ERROR (Literature Compression)
 
+                The app tried to call OpenAI but failed.
+
+                **Error message:**
+                {str(e)}
+                """
+            )
+
+    # Fallback template
     return trim_block(
         """
         ## Literature Compression (Template Mode)
 
-        Focus only on evidence relevant to your hypothesis.
+        Focus only on evidence relevant to your hypothesis (not a general survey).
 
         ### Suggested search queries:
-        - "flow matching" AND "small batch" AND stability
-        - diffusion AND "gradient variance"
-        - rectified flow AND ablation AND CIFAR-10
+        1. "flow matching" AND diffusion AND ("small batch" OR "batch size") AND stability
+        2. ("flow matching" OR "rectified flow") AND ("training stability" OR "gradient variance")
+        3. DDPM AND ("small batch" OR "batch size") AND ("gradient noise" OR "variance")
+        4. "rectified flow" ablation batch size CIFAR-10
 
-        ### Extract from each paper:
-        - Dataset
-        - Batch size
-        - Optimizer
-        - Training instability notes
-        - Any gradient variance metric
-        - Failure cases
-
-        Deliverable:
-        A structured comparison table.
+        ### What to extract from each paper:
+        - dataset, batch size, backbone
+        - optimizer + schedule
+        - instability notes (loss spikes, divergence, NaNs)
+        - any variance proxy
+        - negative results / limitations
         """
     )
 
@@ -162,23 +169,28 @@ def run_literature_compression(
 # Attack Phase
 # ===============================
 
-def run_attack_phase(
-    spec: HypothesisSpec,
-    context: str = "",
-    use_llm: bool = False,
-) -> str:
-
+def run_attack_phase(spec: HypothesisSpec, context: str = "", use_llm: bool = False) -> str:
     spec_txt = _spec_block(spec, context=context)
 
     if use_llm and llm_available():
         try:
             return _call_openai(
-                system="You are a harsh NeurIPS reviewer.",
+                system="You are a harsh NeurIPS/ICML reviewer. Be adversarial and specific.",
                 user=PROMPT_ATTACK.format(spec=spec_txt),
-            )
-        except Exception:
-            pass  # fallback
+            ).strip()
+        except Exception as e:
+            return trim_block(
+                f"""
+                ## LLM ERROR (Attack Phase)
 
+                The app tried to call OpenAI but failed.
+
+                **Error message:**
+                {str(e)}
+                """
+            )
+
+    # Fallback template
     return trim_block(
         """
         ## Reviewer Attack Checklist
@@ -203,41 +215,46 @@ def run_attack_phase(
 # Experiment Plan
 # ===============================
 
-def design_minimal_experiment(
-    spec: HypothesisSpec,
-    context: str = "",
-    use_llm: bool = False,
-) -> str:
-
+def design_minimal_experiment(spec: HypothesisSpec, context: str = "", use_llm: bool = False) -> str:
     spec_txt = _spec_block(spec, context=context)
 
     if use_llm and llm_available():
         try:
             return _call_openai(
-                system="You are a practical ML researcher.",
+                system="You are a practical ML researcher. Produce a minimal, controlled experiment plan.",
                 user=PROMPT_EXPERIMENT_PLAN.format(spec=spec_txt),
-            )
-        except Exception:
-            pass  # fallback
+            ).strip()
+        except Exception as e:
+            return trim_block(
+                f"""
+                ## LLM ERROR (Experiment Plan)
 
+                The app tried to call OpenAI but failed.
+
+                **Error message:**
+                {str(e)}
+                """
+            )
+
+    # Fallback template
     return trim_block(
         """
-        ## Minimal Experiment Plan
+        ## Minimal Experiment Plan (Template Mode)
 
         Dataset: CIFAR-10
         Backbone: U-Net (same config)
-        Methods: DDPM vs Flow Matching
+        Methods: DDPM vs Flow Matching / Rectified Flow
         Batch sizes: 4, 8, 16
-        Steps: 10k initial
+        Steps: 10k initial (first pass)
 
         Log:
         - loss per step
         - global grad norm
-        - variance over 100-step window
+        - variance over 100-step windows
 
         Success:
-        variance_flow <= 0.95 * variance_ddpm
-        and FID not worse by >3
+        - variance_flow <= 0.95 * variance_ddpm
+        - and FID not worse by >3 points after 10k steps
         """
     )
 
@@ -249,21 +266,35 @@ def design_minimal_experiment(
 def generate_conclusion_template(spec: HypothesisSpec) -> str:
     return trim_block(
         f"""
-        ## Conclusion Template
+        ## Conclusion template (YOU write this)
 
-        Hypothesis:
+        ### Hypothesis
         {spec.hypothesis}
 
-        Observations:
+        ### What we observed (facts only)
         - Gradient variance:
+          - Batch=4: ...
+          - Batch=8: ...
+          - Batch=16: ...
         - Loss variance:
-        - FID:
+          - ...
+        - Sample quality (FID @ 10k steps):
+          - ...
 
-        Supported?
-        Why?
+        ### Does it support the hypothesis?
+        - Supported / Not supported / Inconclusive
+        - Why (1–2 sentences, grounded in metrics)
 
-        Alternative explanations?
+        ### Alternative explanations (must address)
+        - Optimizer/schedule interaction
+        - EMA masking instability
+        - Metric definition sensitivity (where grad norms are computed)
 
-        Next decision?
+        ### What would change your mind?
+        - One extra ablation that could flip the conclusion
+
+        ### Next decision
+        - If supported: expand to bigger dataset or stronger baselines
+        - If not: revise hypothesis or adjust regime
         """
     )
