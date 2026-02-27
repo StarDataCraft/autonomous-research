@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 
 from research_agent import (
@@ -43,6 +44,140 @@ tab_main, tab_pipeline = st.tabs(
 
 def _badge(text: str) -> str:
     return f"`{text}`"
+
+
+# =========================================================
+# Cue classification (RULE-BASED)
+#   Goal:
+#     - Split "cue-hit" => Claim vs Limitation/Failure
+#     - Contradiction hunt should ONLY use Limitation/Failure
+#
+# NOTE:
+#   This UI layer does not require changing pipeline code.
+#   If upstream later emits kinds like "cue-claim" / "cue-limit",
+#   this function respects them directly.
+# =========================================================
+_LIMIT_PATTERNS = [
+    # discourse markers / hedges
+    r"\bhowever\b",
+    r"\bbut\b",
+    r"\bdespite\b",
+    r"\balthough\b",
+    r"\bnevertheless\b",
+    r"\byet\b",
+    r"\bwhereas\b",
+    r"\bwhile\b",
+    r"\bin contrast\b",
+    r"\bon the other hand\b",
+    # limitation words
+    r"\blimit(?:ation|ations)?\b",
+    r"\bunderexplored\b",
+    r"\bremain(?:s)? (?:unclear|unknown|underexplored|challenging)\b",
+    r"\bhinder(?:ed|s)?\b",
+    r"\bchallenge(?:s)?\b",
+    r"\bfailure(?:s)?\b",
+    r"\bfail(?:s|ed|ure)?\b",
+    r"\bcollapse(?:s|d)?\b",
+    r"\bfar from\b",
+    r"\black of\b",
+    r"\bdoes not\b",
+    r"\bcannot\b",
+    r"\bunable\b",
+    r"\bbias\b",
+    r"\bvariance\b.*\bhigh\b",
+    r"\bunstable\b",
+    r"\bmode(?:s)?\b.*\bdeplet(?:ion|ed)\b",
+    r"\btrade[- ]off\b",
+    r"\bconfound(?:er|ing)?\b",
+]
+
+_CLAIM_PATTERNS = [
+    r"\bwe propose\b",
+    r"\bwe present\b",
+    r"\bwe introduce\b",
+    r"\bwe develop\b",
+    r"\bwe derive\b",
+    r"\bwe show\b",
+    r"\bwe confirm\b",
+    r"\bwe establish\b",
+    r"\bwe prove\b",
+    r"\bwe demonstrate\b",
+    r"\bwe provide\b",
+    r"\bour main contribution\b",
+    r"\bthis paper (?:proposes|presents|introduces|develops)\b",
+]
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _is_limitation_failure_sentence(sentence: str) -> bool:
+    s = _norm(sentence)
+    if not s:
+        return False
+    # fast path: explicit limitation cues
+    for pat in _LIMIT_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
+
+
+def _is_claim_sentence(sentence: str) -> bool:
+    s = _norm(sentence)
+    if not s:
+        return False
+    for pat in _CLAIM_PATTERNS:
+        if re.search(pat, s):
+            return True
+    return False
+
+
+def _classify_hit(kind: str, sentence: str) -> str:
+    """
+    Return a display tag:
+      - "cue: limitation/failure"
+      - "cue: claim"
+      - "relevance"
+      - fallback for unknown kinds
+    """
+    k = (kind or "").strip().lower()
+
+    # If upstream already split them, respect it.
+    if k in {"cue-limit", "cue-limitation", "cue-failure", "limitation", "failure"}:
+        return "cue: limitation/failure"
+    if k in {"cue-claim", "claim"}:
+        return "cue: claim"
+
+    if k == "relevance":
+        return "relevance"
+
+    # Backward-compat: old pipeline emits "cue-hit"
+    if k == "cue-hit":
+        if _is_limitation_failure_sentence(sentence):
+            return "cue: limitation/failure"
+        # if it's clearly a claim, call it claim
+        if _is_claim_sentence(sentence):
+            return "cue: claim"
+        # ambiguous => default to claim (safer than polluting contradictions)
+        return "cue: claim"
+
+    # unknown -> leave as-is
+    return k or "unknown"
+
+
+def _render_key_sentences(hit_list, title="Key sentences"):
+    """
+    hit_list: list of objects with .kind and .sentence
+    """
+    if not hit_list:
+        st.write("(none)")
+        return
+
+    st.markdown(f"**{title}:**")
+    for h in hit_list:
+        tag = _classify_hit(getattr(h, "kind", ""), getattr(h, "sentence", ""))
+        st.write(f"• ({tag}) {h.sentence}")
 
 
 # =========================================================
@@ -178,10 +313,7 @@ with tab_main:
                     f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
                 )
                 if getattr(it, "key_sentences", None):
-                    st.markdown("**Key sentences (cue-hit preferred):**")
-                    for h in it.key_sentences:
-                        tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
-                        st.write(f"• ({tag}) {h.sentence}")
+                    _render_key_sentences(it.key_sentences, title="Key sentences (cue preferred; split into claim vs limitation/failure)")
                 st.divider()
 
         with colB:
@@ -203,10 +335,7 @@ with tab_main:
                     f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
                 )
                 if getattr(it, "key_sentences", None):
-                    st.markdown("**Key sentences:**")
-                    for h in it.key_sentences:
-                        tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
-                        st.write(f"• ({tag}) {h.sentence}")
+                    _render_key_sentences(it.key_sentences, title="Key sentences (split into claim vs limitation/failure)")
                 st.divider()
 
         # ===== Cluster map =====
@@ -236,9 +365,7 @@ with tab_main:
 
             st.markdown("**Key sentences (rep):**")
             if getattr(rep, "key_sentences", None):
-                for h in rep.key_sentences:
-                    tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
-                    st.write(f"• ({tag}) {h.sentence}")
+                _render_key_sentences(rep.key_sentences, title="Key sentences (rep; split into claim vs limitation/failure)")
             else:
                 st.write("(none)")
 
@@ -289,9 +416,23 @@ with tab_main:
             for i, title in enumerate(report.cross_cluster_bridges, start=1):
                 st.write(f"{i}. {title}")
 
-            st.markdown("### C) Limitations / contradictions (cue-hit sentences)")
-            for p in report.contradictions:
-                st.write("• " + p)
+            # 핵심 수정: contradictions ONLY from limitation/failure cues
+            st.markdown("### C) Limitations / failure signals (from cue-hit; filtered)")
+            raw = list(report.contradictions or [])
+            only_limits = [s for s in raw if _is_limitation_failure_sentence(s)]
+            if not only_limits:
+                st.info(
+                    "没有检测到明显的 Limitation/Failure 句（基于规则过滤）。"
+                    "这通常意味着：上游把很多 Claim 句也当成了 cue-hit。"
+                    "建议下一步在 pipeline/synthesis 中真正拆分 cue-claim vs cue-limit。"
+                )
+                # still show a small sample for debugging
+                with st.expander("Show raw contradiction candidates (debug)"):
+                    for s in raw[: min(30, len(raw))]:
+                        st.write("• " + s)
+            else:
+                for s in only_limits:
+                    st.write("• " + s)
 
             st.markdown("### D) Gaps (what’s missing)")
             for g in report.gaps:
