@@ -1,6 +1,9 @@
 import streamlit as st
-from cue_rules import classify_cue_sentence, is_limitation_failure
-from cue_rules import is_limitation_failure
+import re
+from typing import Optional, Tuple, List
+import numpy as np
+
+from cue_rules import is_limitation_failure  # keep as fallback only
 
 from research_agent import (
     HypothesisSpec,
@@ -13,6 +16,15 @@ from research_agent import (
 
 from pipeline_abstract import run_abstract_pipeline
 from synthesis import synthesize_from_clusters
+
+
+# -----------------------------
+# Optional dependency: sentence-transformers
+# -----------------------------
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 
 st.set_page_config(page_title="Autonomous Research Engine", layout="wide")
@@ -48,34 +60,116 @@ def _badge(text: str) -> str:
 
 
 # =========================================================
-# Cue classification (RULE-BASED)
-#   Uses cue_rules.py (two-stage: marker AND negative semantics)
-#   + strong claim override
+# Cue classification (EMBEDDING-BASED, No LLM)
+#   - NOT rule-based
+#   - Uses sentence embeddings + prototype similarity
+#   - Designed to catch:
+#       * framing claim: "can be viewed under unified framework"
+#       * contrastive contribution: "In contrast, the approach proposed here ..."
 # =========================================================
 
-def _strip_suffix_citation(s: str) -> str:
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _strip_title_suffix(s: str) -> str:
     """
-    report.contradictions / headline points often look like:
+    Many strings are like:
       "<sentence> — <paper title>"
     We only want to classify the sentence part.
     """
-    if not s:
-        return ""
-    # prefer the exact delimiter used in your synthesis: " — "
+    s = (s or "").strip()
     if " — " in s:
         return s.split(" — ", 1)[0].strip()
-    # fallback: hyphen variants
+    if "—" in s:
+        return s.split("—", 1)[0].strip()
     if " - " in s:
         return s.split(" - ", 1)[0].strip()
-    return s.strip()
+    return s
 
 
-def _classify_hit(kind: str, sentence: str) -> str:
+# --- prototypes: edit these to "teach" the classifier your boundary
+_CLAIM_PROTOTYPES: List[str] = [
+    "We propose a new method that improves performance.",
+    "We present a unified framework connecting different approaches.",
+    "Despite their differences, both methods can be viewed under a unified framework.",
+    "This paper introduces an approach that achieves better results.",
+    "We show that our method yields improved robustness.",
+    "The approach proposed here gives better results without this assumption.",
+    "In contrast, the approach proposed here gives X without this assumption.",
+    "This approach provides batch size invariance without additional assumptions.",
+    "We provide theoretical insights and a comprehensive comparison under a unified framework.",
+]
+
+_LIMIT_PROTOTYPES: List[str] = [
+    "However, the method has limitations and remains underexplored.",
+    "A major challenge is instability and degraded performance.",
+    "The approach is hindered by significant computational overhead during inference.",
+    "Results are far from state-of-the-art and fail in some settings.",
+    "Theoretical understanding remains unclear or unknown.",
+    "A key issue is bias or high variance leading to failure modes.",
+    "The method collapses or becomes unstable under distribution shift.",
+]
+
+
+class CueClassifier:
+    """
+    Prototype-based semantic classifier.
+    Returns:
+      - label: "cue: claim" or "cue: limitation/failure"
+      - claim_score, limit_score (max cosine similarity to each prototype set)
+
+    Notes:
+      - We use normalize_embeddings=True so dot product = cosine similarity.
+      - We add a small margin so "weak" differences don't flip too easily.
+    """
+
+    def __init__(self, embed_model_name: str, margin: float = 0.02):
+        if SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers not installed")
+        self.model_name = embed_model_name
+        self.margin = float(margin)
+        self.model = SentenceTransformer(embed_model_name)
+
+        self.claim_vecs = self._encode(_CLAIM_PROTOTYPES)
+        self.limit_vecs = self._encode(_LIMIT_PROTOTYPES)
+
+    def _encode(self, texts: List[str]) -> np.ndarray:
+        vecs = self.model.encode(texts, normalize_embeddings=True)
+        return np.asarray(vecs, dtype=np.float32)
+
+    def score(self, sentence: str) -> Tuple[float, float]:
+        s = _norm(_strip_title_suffix(sentence))
+        if not s:
+            return 0.0, 0.0
+        v = self.model.encode([s], normalize_embeddings=True)
+        v = np.asarray(v[0], dtype=np.float32)
+        claim_score = float(np.max(self.claim_vecs @ v))
+        limit_score = float(np.max(self.limit_vecs @ v))
+        return claim_score, limit_score
+
+    def predict(self, sentence: str) -> str:
+        claim_score, limit_score = self.score(sentence)
+        # require limit to win by margin to call limitation; otherwise claim
+        if limit_score >= claim_score + self.margin:
+            return "cue: limitation/failure"
+        return "cue: claim"
+
+
+@st.cache_resource(show_spinner=False)
+def _get_classifier(embed_model_name: str) -> Optional[CueClassifier]:
+    try:
+        return CueClassifier(embed_model_name=embed_model_name)
+    except Exception:
+        return None
+
+
+def _classify_hit(kind: str, sentence: str, clf: Optional[CueClassifier]) -> str:
     """
     Return a display tag:
       - "cue: limitation/failure"
       - "cue: claim"
-      - "relevance"
+      - "relevance" / "relevance-fallback"
       - fallback for unknown kinds
     """
     k = (kind or "").strip().lower()
@@ -86,22 +180,27 @@ def _classify_hit(kind: str, sentence: str) -> str:
         return "cue: limitation/failure"
     if k in {"cue-claim", "claim"}:
         return "cue: claim"
-    if k == "relevance":
-        return "relevance"
 
-    # Backward-compat: old pipeline emits "cue-hit"
+    # Allow semantic override for relevance sentences too (fixes: "In contrast ... proposed here ...")
+    if k in {"relevance", "relevance-fallback"}:
+        if clf is not None:
+            sem = clf.predict(sent)
+            # only upgrade to claim (do NOT downgrade relevance -> limitation to avoid noise)
+            if sem == "cue: claim":
+                return "cue: claim"
+        return "relevance" if k == "relevance" else "relevance-fallback"
+
+    # Backward-compat: old pipeline emits cue-hit
     if k == "cue-hit":
-        decision = classify_cue_sentence(sent)
-        if decision.kind == "limitation/failure":
-            return "cue: limitation/failure"
-        if decision.kind == "claim":
-            return "cue: claim"
-        return "relevance"  # relevance-fallback
+        if clf is not None:
+            return clf.predict(sent)
+        # fallback if classifier unavailable
+        return "cue: claim"
 
-    # unknown -> leave as-is
     return k or "unknown"
-    
-def _render_key_sentences(hit_list, title="Key sentences"):
+
+
+def _render_key_sentences(hit_list, clf: Optional[CueClassifier], title: str = "Key sentences"):
     """
     hit_list: list of objects with .kind and .sentence
     """
@@ -111,8 +210,20 @@ def _render_key_sentences(hit_list, title="Key sentences"):
 
     st.markdown(f"**{title}:**")
     for h in hit_list:
-        tag = _classify_hit(getattr(h, "kind", ""), getattr(h, "sentence", ""))
+        tag = _classify_hit(getattr(h, "kind", ""), getattr(h, "sentence", ""), clf)
         st.write(f"• ({tag}) {h.sentence}")
+
+
+def _semantic_is_limitation_failure(text: str, clf: Optional[CueClassifier]) -> bool:
+    """
+    Use semantic classifier when available; otherwise fall back to cue_rules.py.
+    """
+    s = _strip_title_suffix(text)
+    if not s:
+        return False
+    if clf is not None:
+        return clf.predict(s) == "cue: limitation/failure"
+    return bool(is_limitation_failure(s))
 
 
 # =========================================================
@@ -159,6 +270,14 @@ with tab_main:
         )
     with col6:
         key_sents_n = st.slider("Key sentences per paper", 1, 5, 3, step=1)
+
+    # classifier init (cached)
+    clf = _get_classifier(embed_model)
+    if clf is None:
+        st.warning(
+            "Semantic cue classifier unavailable (missing sentence-transformers or model download failed). "
+            "Will fall back to conservative labeling and rule-based limitation filter."
+        )
 
     # ---------- Session state init ----------
     if "insights" not in st.session_state:
@@ -248,7 +367,11 @@ with tab_main:
                     f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
                 )
                 if getattr(it, "key_sentences", None):
-                    _render_key_sentences(it.key_sentences, title="Key sentences (cue preferred; split into claim vs limitation/failure)")
+                    _render_key_sentences(
+                        it.key_sentences,
+                        clf,
+                        title="Key sentences (cue preferred; split into claim vs limitation/failure)",
+                    )
                 st.divider()
 
         with colB:
@@ -270,7 +393,7 @@ with tab_main:
                     f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
                 )
                 if getattr(it, "key_sentences", None):
-                    _render_key_sentences(it.key_sentences, title="Key sentences (split into claim vs limitation/failure)")
+                    _render_key_sentences(it.key_sentences, clf, title="Key sentences (split into claim vs limitation/failure)")
                 st.divider()
 
         # ===== Cluster map =====
@@ -300,7 +423,7 @@ with tab_main:
 
             st.markdown("**Key sentences (rep):**")
             if getattr(rep, "key_sentences", None):
-                _render_key_sentences(rep.key_sentences, title="Key sentences (rep; split into claim vs limitation/failure)")
+                _render_key_sentences(rep.key_sentences, clf, title="Key sentences (rep; split into claim vs limitation/failure)")
             else:
                 st.write("(none)")
 
@@ -351,46 +474,16 @@ with tab_main:
             for i, title in enumerate(report.cross_cluster_bridges, start=1):
                 st.write(f"{i}. {title}")
 
-            # 핵심 수정: contradictions ONLY from limitation/failure cues
+            # ---- C) Limitations / failure signals (semantic filter; fallback to rules)
             st.markdown("### C) Limitations / failure signals (from cue-hit; filtered)")
             raw = list(report.contradictions or [])
+            only_limits = [s for s in raw if _semantic_is_limitation_failure(s, clf)]
 
-            # 핵심 수정: contradictions ONLY from limitation/failure cues (robust rule)
-            st.markdown("### C) Limitations / failure signals (from cue-hit; filtered)")
-            raw = list(report.contradictions or [])
-            
-            def _strip_title_suffix(x: str) -> str:
-                """
-                report.contradictions entries are often like:
-                  "<sentence>  — *<title>*"
-                We only want to classify the sentence part.
-                """
-                x = (x or "").strip()
-                if "—" in x:
-                    x = x.split("—", 1)[0].strip()
-                return x
-            
-            only_limits = [s for s in raw if is_limitation_failure(_strip_title_suffix(s))]
-            
             if not only_limits:
                 st.info(
-                    "没有检测到明显的 Limitation/Failure 句（基于两段式规则过滤）。"
-                    "这通常意味着：本轮 cue-hit 里更多是 framing / claim 句，而不是问题句。"
+                    "没有检测到明显的 Limitation/Failure 句（语义过滤）。"
+                    "这通常意味着：本轮 cue-hit/contradictions 里更多是 framing/claim 或中性句。"
                 )
-                with st.expander("Show raw contradiction candidates (debug)"):
-                    for s in raw[: min(30, len(raw))]:
-                        st.write("• " + s)
-            else:
-                for s in only_limits:
-                    st.write("• " + s)
-        
-            if not only_limits:
-                st.info(
-                    "没有检测到明显的 Limitation/Failure 句（基于规则过滤）。"
-                    "这通常意味着：上游把很多 Claim 句也当成了 cue-hit。"
-                    "建议下一步在 pipeline/synthesis 中真正拆分 cue-claim vs cue-limit。"
-                )
-                # still show a small sample for debugging
                 with st.expander("Show raw contradiction candidates (debug)"):
                     for s in raw[: min(30, len(raw))]:
                         st.write("• " + s)
