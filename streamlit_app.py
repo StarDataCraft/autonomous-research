@@ -19,7 +19,7 @@ st.caption("主界面：arXiv 搜索 + embedding 阅读（Abstract-only，No LLM
 with st.sidebar:
     st.header("Mode (optional)")
     use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=llm_available())
-    st.caption("注意：No-LLM 主引擎不依赖这个开关。仅影响第二个 tab 的旧 pipeline。")
+    st.caption("No-LLM 主引擎不依赖这个开关。仅影响第二个 tab 的旧 pipeline。")
 
     st.divider()
     st.header("Timebox")
@@ -27,18 +27,22 @@ with st.sidebar:
     st.write(f"当前：{minutes} 分钟 sprint")
 
 
-# ✅ 把 Search tab 放在第一个（主界面）
 tab_main, tab_pipeline = st.tabs(["Search & Read Abstracts (No LLM)  ⭐", "Pipeline (Template/LLM optional)"])
 
 
+def _badge(text: str) -> str:
+    # simple badge-like inline
+    return f"`{text}`"
+
+
 # =========================
-# MAIN TAB: Abstract engine
+# MAIN TAB
 # =========================
 with tab_main:
     st.subheader("arXiv Search + Embedding Read (Abstract-only)")
     st.caption(
         "流程：Recall(arXiv) → Embedding re-rank → MMR diversify → Cluster map → "
-        "Novelty score（异端/突破点）→ Contradiction hunt（claims/limits/failure sentences）"
+        "Novelty（离群但相关）→ Bridge（跨簇连接点）→ Type（method/theory/empirical）→ Key sentences（cue优先）"
     )
 
     q = st.text_area(
@@ -69,7 +73,7 @@ with tab_main:
             index=0,
         )
     with col6:
-        contradiction_top_n = st.slider("Contradiction sentences per paper", 1, 5, 3, step=1)
+        contradiction_top_n = st.slider("Key sentences per paper", 1, 5, 3, step=1)
 
     go = st.button("Search & organize", type="primary")
 
@@ -94,26 +98,61 @@ with tab_main:
             st.write(diag["queries"])
             st.write("Embedding model:", diag["embed_model"])
 
-        # ===== Novelty leaderboard =====
-        st.markdown("## Novelty leaderboard (异端/突破点候选)")
-        st.caption("Novelty = 1 - max similarity to papers in other clusters. 越高越可能是“跟别的簇都不像”的点。")
+        # ====== Leaderboards ======
+        st.markdown("## Leaderboards")
 
-        novelty_sorted = sorted(insights, key=lambda x: (-x.novelty, -x.relevance))
-        topN = novelty_sorted[: min(12, len(novelty_sorted))]
-        for rank, it in enumerate(topN, start=1):
-            p = it.paper
-            st.markdown(
-                f"**{rank}.** [{p.title}]({p.entry_url})  \n"
-                f"Cluster={it.cluster_id}  ·  Relevance={it.relevance:.3f}  ·  **Novelty={it.novelty:.3f}**  \n"
-                f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
-            )
-            if it.contradiction_sentences:
-                st.markdown("**Contradiction/Limit/Fault hints (from abstract):**")
-                for s in it.contradiction_sentences:
-                    st.write("• " + s)
-            st.divider()
+        colA, colB = st.columns(2)
 
-        # ===== Cluster map =====
+        # Novelty leaderboard (rank-adjusted)
+        with colA:
+            st.markdown("### Novelty leaderboard (异端/突破点候选)")
+            st.caption("按 `novelty_rank = novelty × f(relevance)` 排序，避免“离题但离群”霸榜。")
+            novelty_sorted = sorted(insights, key=lambda x: (-x.novelty_rank, -x.relevance))
+            topN = novelty_sorted[: min(10, len(novelty_sorted))]
+
+            for rank, it in enumerate(topN, start=1):
+                p = it.paper
+                st.markdown(
+                    f"**{rank}.** [{p.title}]({p.entry_url})  \n"
+                    f"{_badge(it.paper_type)}  Cluster={it.cluster_id}  ·  "
+                    f"Rel={it.relevance:.3f}  ·  Nov={it.novelty:.3f}  ·  **NovRank={it.novelty_rank:.3f}**  \n"
+                    f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
+                )
+                if it.key_sentences:
+                    st.markdown("**Key sentences (cue-hit preferred):**")
+                    for h in it.key_sentences:
+                        tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
+                        st.write(f"• ({tag}) {h.sentence}")
+                st.divider()
+
+        # Bridge leaderboard
+        with colB:
+            st.markdown("### Bridge papers (跨簇连接点)")
+            st.caption("Bridge 候选：同时接近多个簇中心（top2 centroid similarity 高，且 gap 小）。适合找“统一视角/综述/桥梁工作”。")
+            bridge_sorted = sorted(insights, key=lambda x: (-x.bridge_rank, -x.relevance))
+            topB = bridge_sorted[: min(10, len(bridge_sorted))]
+
+            for rank, it in enumerate(topB, start=1):
+                p = it.paper
+                # show top centroid sims
+                sims = sorted(it.cluster_sims.items(), key=lambda kv: kv[1], reverse=True)
+                sim_str = ", ".join([f"C{cid}:{v:.2f}" for cid, v in sims[:3]])
+
+                st.markdown(
+                    f"**{rank}.** [{p.title}]({p.entry_url})  \n"
+                    f"{_badge(it.paper_type)}  Cluster={it.cluster_id}  ·  "
+                    f"Rel={it.relevance:.3f}  ·  Bridge={it.bridge_score:.3f}  ·  **BridgeRank={it.bridge_rank:.3f}**  \n"
+                    f"Centroid sims: {sim_str}  \n"
+                    f"*{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
+                )
+                if it.key_sentences:
+                    st.markdown("**Key sentences:**")
+                    for h in it.key_sentences:
+                        tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
+                        st.write(f"• ({tag}) {h.sentence}")
+                st.divider()
+
+        # ====== Cluster map ======
         st.markdown("## Cluster map (what to read)")
         for c in clusters:
             st.markdown(
@@ -121,11 +160,11 @@ with tab_main:
             )
             rep = c.centroid_paper
             rp = rep.paper
+
             st.markdown(
                 f"**Representative:** [{rp.title}]({rp.entry_url})  \n"
-                f"*{', '.join(rp.authors[:6])}*  \n"
-                f"Updated: {rp.updated}  ·  Category: {rp.primary_category or 'n/a'}  ·  "
-                f"Relevance={rep.relevance:.3f}  ·  Novelty={rep.novelty:.3f}"
+                f"{_badge(rep.paper_type)}  Updated: {rp.updated}  ·  Category: {rp.primary_category or 'n/a'}  ·  "
+                f"Rel={rep.relevance:.3f}  ·  Nov={rep.novelty:.3f}  ·  Bridge={rep.bridge_score:.3f}"
             )
 
             st.markdown("**Top papers in this cluster:**")
@@ -133,14 +172,16 @@ with tab_main:
                 p = it.paper
                 st.markdown(
                     f"- [{p.title}]({p.entry_url})  "
-                    f"(Rel={it.relevance:.3f}, Nov={it.novelty:.3f})  \n"
+                    f"{_badge(it.paper_type)}  "
+                    f"(Rel={it.relevance:.3f}, NovRank={it.novelty_rank:.3f}, BridgeRank={it.bridge_rank:.3f})  \n"
                     f"  *{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}"
                 )
 
-            st.markdown("**Contradiction hunt (rep):**")
-            if rep.contradiction_sentences:
-                for s in rep.contradiction_sentences:
-                    st.write("• " + s)
+            st.markdown("**Key sentences (rep):**")
+            if rep.key_sentences:
+                for h in rep.key_sentences:
+                    tag = "⚠️ cue-hit" if h.kind == "cue-hit" else "relevance"
+                    st.write(f"• ({tag}) {h.sentence}")
             else:
                 st.write("(none)")
 
@@ -148,14 +189,15 @@ with tab_main:
             st.write(rp.summary)
             st.divider()
 
-        # ===== Diversified list =====
+        # ====== Diversified list ======
         st.markdown("## Selected papers (MMR diversified list)")
-        mmr_sorted = sorted(insights, key=lambda x: (-x.relevance, -x.novelty))
+        mmr_sorted = sorted(insights, key=lambda x: (-x.relevance, -x.bridge_rank, -x.novelty_rank))
         for i, it in enumerate(mmr_sorted, start=1):
             p = it.paper
             st.markdown(
                 f"{i}. [{p.title}]({p.entry_url})  \n"
-                f"   Cluster={it.cluster_id}  ·  Rel={it.relevance:.3f}  ·  Nov={it.novelty:.3f}  ·  "
+                f"   {_badge(it.paper_type)}  Cluster={it.cluster_id}  ·  "
+                f"Rel={it.relevance:.3f}  ·  NovRank={it.novelty_rank:.3f}  ·  BridgeRank={it.bridge_rank:.3f}  ·  "
                 f"Updated: {p.updated}  ·  PDF: {p.pdf_url}"
             )
 
