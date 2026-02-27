@@ -10,6 +10,7 @@ from research_agent import (
 )
 
 from pipeline_abstract import run_abstract_pipeline
+from synthesis import synthesize_from_clusters
 
 
 st.set_page_config(page_title="Autonomous Research Engine", layout="wide")
@@ -31,7 +32,6 @@ tab_main, tab_pipeline = st.tabs(["Search & Read Abstracts (No LLM)  ⭐", "Pipe
 
 
 def _badge(text: str) -> str:
-    # simple badge-like inline
     return f"`{text}`"
 
 
@@ -73,7 +73,7 @@ with tab_main:
             index=0,
         )
     with col6:
-        contradiction_top_n = st.slider("Key sentences per paper", 1, 5, 3, step=1)
+        key_sents_n = st.slider("Key sentences per paper", 1, 5, 3, step=1)
 
     go = st.button("Search & organize", type="primary")
 
@@ -86,7 +86,7 @@ with tab_main:
                 mmr_lambda=mmr_lambda,
                 category_filter=category_filter,
                 embed_model=embed_model,
-                contradiction_top_n=contradiction_top_n,
+                contradiction_top_n=key_sents_n,
             )
             status.update(label="Done", state="complete", expanded=False)
 
@@ -134,7 +134,6 @@ with tab_main:
 
             for rank, it in enumerate(topB, start=1):
                 p = it.paper
-                # show top centroid sims
                 sims = sorted(it.cluster_sims.items(), key=lambda kv: kv[1], reverse=True)
                 sim_str = ", ".join([f"C{cid}:{v:.2f}" for cid, v in sims[:3]])
 
@@ -200,6 +199,46 @@ with tab_main:
                 f"Rel={it.relevance:.3f}  ·  NovRank={it.novelty_rank:.3f}  ·  BridgeRank={it.bridge_rank:.3f}  ·  "
                 f"Updated: {p.updated}  ·  PDF: {p.pdf_url}"
             )
+
+        # ====== Synthesis ======
+        st.markdown("## Synthesis: key points & new directions")
+        st.caption("基于当前检索到的 papers（title+abstract），自动产出：证据地图、限制/争议、缺口、以及可执行的新研究方向（No LLM）。")
+
+        if st.button("Synthesize: Key Points & New Directions"):
+            report = synthesize_from_clusters(clusters, insights)
+
+            st.markdown("### A) Evidence map (by cluster)")
+            for t in report.theme_summaries:
+                st.markdown(
+                    f"#### Cluster {t.cluster_id} · keywords: `{', '.join(t.keywords)}`  "
+                    f"(method/theory/empirical = {t.method_theory_empirical})"
+                )
+                st.markdown("**Headline points (from abstracts):**")
+                for p in t.headline_points:
+                    st.write("• " + p)
+                st.markdown("**Top evidence papers:**")
+                for title in t.evidence_papers:
+                    st.write("• " + title)
+                st.divider()
+
+            st.markdown("### B) Bridge papers (cross-cluster connectors)")
+            for i, title in enumerate(report.cross_cluster_bridges, start=1):
+                st.write(f"{i}. {title}")
+
+            st.markdown("### C) Limitations / contradictions (cue-hit sentences)")
+            for p in report.contradictions:
+                st.write("• " + p)
+
+            st.markdown("### D) Gaps (what’s missing)")
+            for g in report.gaps:
+                st.write("• " + g)
+
+            st.markdown("### E) New directions (rules-based proposals)")
+            for d in report.new_directions:
+                st.markdown("• " + d)
+
+    else:
+        st.info("在上面填写 hypothesis / query，然后点 **Search & organize**。")
 
 
 # =========================
