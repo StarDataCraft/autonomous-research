@@ -5,8 +5,13 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional
 import re
 import math
+import time
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 import numpy as np
+
+import requests
 
 # --- Optional: better embeddings if available ---
 _HAS_ST = False
@@ -392,13 +397,11 @@ def analyze_papers(
             bridge_rank=float(bridge_rank[i]),
             key_sentences=hits,
         )
-        # attach axis tag via dict expansion (keep dataclass clean)
-        d = asdict(sp)
-        d["axis"] = _axis
-        scored.append(_dict_to_scoredpaper(d))  # keep as dataclass for further ops
+        # attach axis tag dynamically
+        setattr(sp, "axis", _axis)
+        scored.append(sp)
 
     # --- cluster keywords (TF-IDF on titles+abstracts) ---
-    # Always available: use fallback tfidf for interpretability
     vec = TfidfVectorizer(lowercase=True, stop_words="english", max_features=30000, ngram_range=(1, 2))
     X = vec.fit_transform(docs)
     vocab = np.array(vec.get_feature_names_out())
@@ -432,17 +435,11 @@ def analyze_papers(
     for sp in scored:
         if sp.relevance < 0.20:
             continue
-        ax = getattr(sp, "axis", None)  # will be added by helper below
-        # fallback: re-tag if missing
-        if ax is None:
-            ax = axis_tag(sp.paper.title, sp.paper.abstract)
-
+        ax = getattr(sp, "axis", axis_tag(sp.paper.title, sp.paper.abstract))
         if ax == "optimizer/dynamics":
             novelty_confounder.append(sp)
         else:
             novelty_in_topic.append(sp)
-
-        # bridge novelty: "bridge_rank" high and novelty decent
         novelty_bridge.append(sp)
 
     novelty_in_topic.sort(key=lambda x: x.novelty_rank, reverse=True)
@@ -451,21 +448,22 @@ def analyze_papers(
 
     bridge_board = sorted(scored, key=lambda x: x.bridge_rank, reverse=True)
 
-    # --- build return dict (serialize) ---
-    scored_dicts = []
-    for sp in scored:
+    # --- serialize ---
+    def sp_to_dict(sp: ScoredPaper) -> Dict:
         d = asdict(sp)
-        d["axis"] = axis_tag(sp.paper.title, sp.paper.abstract)
-        scored_dicts.append(d)
+        d["axis"] = getattr(sp, "axis", axis_tag(sp.paper.title, sp.paper.abstract))
+        return d
+
+    scored_dicts = [sp_to_dict(sp) for sp in scored]
 
     return {
         "scored_papers": scored_dicts,
         "clusters": clusters,
         "leaderboards": {
-            "novelty_in_topic": [asdict(x) | {"axis": axis_tag(x.paper.title, x.paper.abstract)} for x in novelty_in_topic[:20]],
-            "novelty_confounder": [asdict(x) | {"axis": axis_tag(x.paper.title, x.paper.abstract)} for x in novelty_confounder[:20]],
-            "novelty_bridge": [asdict(x) | {"axis": axis_tag(x.paper.title, x.paper.abstract)} for x in novelty_bridge[:20]],
-            "bridge": [asdict(x) | {"axis": axis_tag(x.paper.title, x.paper.abstract)} for x in bridge_board[:20]],
+            "novelty_in_topic": [sp_to_dict(x) for x in novelty_in_topic[:20]],
+            "novelty_confounder": [sp_to_dict(x) for x in novelty_confounder[:20]],
+            "novelty_bridge": [sp_to_dict(x) for x in novelty_bridge[:20]],
+            "bridge": [sp_to_dict(x) for x in bridge_board[:20]],
         },
         "meta": {
             "embedder": "sbert(all-MiniLM-L6-v2)" if embedder.mode == "sbert" else "tfidf",
@@ -475,26 +473,130 @@ def analyze_papers(
 
 
 # =========================
-# Helpers for dict <-> dataclass
+# Free abstract-only search (arXiv)
 # =========================
-def _dict_to_scoredpaper(d: Dict) -> ScoredPaper:
-    # Convert nested paper + key_sentences back to dataclasses
-    paper_d = d["paper"]
-    paper = Paper(**paper_d)
-    hits = []
-    for h in d.get("key_sentences", []):
-        hits.append(SentenceHit(**h))
-    sp = ScoredPaper(
-        paper=paper,
-        cluster_id=int(d["cluster_id"]),
-        paper_type=str(d["paper_type"]),
-        relevance=float(d["relevance"]),
-        novelty=float(d["novelty"]),
-        novelty_rank=float(d["novelty_rank"]),
-        bridge=float(d["bridge"]),
-        bridge_rank=float(d["bridge_rank"]),
-        key_sentences=hits,
+_ARXIV_API = "http://export.arxiv.org/api/query"
+_ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+
+
+def fetch_arxiv_papers(
+    query: str,
+    max_results: int = 50,
+    start: int = 0,
+    sort_by: str = "relevance",      # relevance | lastUpdatedDate | submittedDate
+    sort_order: str = "descending",  # ascending | descending
+    timeout_sec: int = 20,
+    sleep_sec: float = 0.0,
+) -> List[Paper]:
+    """
+    Free, no key, abstract-only.
+    Returns List[Paper] (your local dataclass).
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    if sleep_sec and sleep_sec > 0:
+        time.sleep(sleep_sec)
+
+    q = quote_plus(query)
+    url = (
+        f"{_ARXIV_API}"
+        f"?search_query=all:{q}"
+        f"&start={start}"
+        f"&max_results={max_results}"
+        f"&sortBy={sort_by}"
+        f"&sortOrder={sort_order}"
     )
-    # attach dynamic field
-    setattr(sp, "axis", d.get("axis", axis_tag(paper.title, paper.abstract)))
-    return sp
+
+    headers = {"User-Agent": "autonomous-research/0.1 (no-contact)"}
+    r = requests.get(url, headers=headers, timeout=timeout_sec)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+
+    papers: List[Paper] = []
+    for entry in root.findall("atom:entry", _ARXIV_NS):
+        title = normalize_text((entry.findtext("atom:title", default="", namespaces=_ARXIV_NS) or ""))
+        abstract = normalize_text((entry.findtext("atom:summary", default="", namespaces=_ARXIV_NS) or ""))
+        entry_id = (entry.findtext("atom:id", default="", namespaces=_ARXIV_NS) or "").strip()
+        updated = (entry.findtext("atom:updated", default="", namespaces=_ARXIV_NS) or "").strip()
+
+        # authors
+        author_names = []
+        for a in entry.findall("atom:author", _ARXIV_NS):
+            name = (a.findtext("atom:name", default="", namespaces=_ARXIV_NS) or "").strip()
+            if name:
+                author_names.append(name)
+        authors = ", ".join(author_names)
+
+        # paper_id
+        paper_id = entry_id.rsplit("/", 1)[-1] if entry_id else title[:32]
+
+        # pdf link
+        pdf_url = ""
+        for lk in entry.findall("atom:link", _ARXIV_NS):
+            href = lk.attrib.get("href", "")
+            lktype = lk.attrib.get("type", "")
+            rel = lk.attrib.get("rel", "")
+            title_attr = lk.attrib.get("title", "")
+            if lktype == "application/pdf" or title_attr.lower() == "pdf":
+                pdf_url = href
+                break
+        if not pdf_url and paper_id:
+            pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
+
+        url_abs = entry_id
+
+        if title and abstract:
+            papers.append(Paper(
+                paper_id=paper_id,
+                title=title,
+                abstract=abstract,
+                updated=updated,
+                pdf_url=pdf_url,
+                authors=authors,
+                url=url_abs,
+            ))
+
+    return papers
+
+
+# =========================
+# Compatibility layer (IMPORTANT)
+# =========================
+def run_abstract_pipeline(
+    query: str,
+    max_results: int = 50,
+    sort_by: str = "relevance",
+    sort_order: str = "descending",
+    sleep_sec: float = 0.0,
+) -> List[Dict]:
+    """
+    This is the function your streamlit_app.py imports.
+    It MUST exist.
+
+    Returns: List[dict] papers with keys matching your UI usage.
+    """
+    papers = fetch_arxiv_papers(
+        query=query,
+        max_results=max_results,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        sleep_sec=sleep_sec,
+    )
+    return [asdict(p) for p in papers]
+
+
+def run_abstract_analysis_pipeline(
+    query: str,
+    max_results: int = 50,
+    k_clusters: int = 4,
+    seed: int = 42,
+) -> Dict:
+    """
+    Convenience: search -> analyze.
+    Useful if your UI wants one call.
+    """
+    papers = fetch_arxiv_papers(query=query, max_results=max_results)
+    return analyze_papers(papers, query_text=query, k_clusters=k_clusters, seed=seed)
