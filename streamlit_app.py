@@ -18,7 +18,7 @@ st.caption(
 
 with st.sidebar:
     st.header("Mode")
-    use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=False)
+    use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=True)
     st.markdown(
         "- 如果不开 LLM：用结构化模板生成高质量 research 计划（可直接用）。\n"
         "- 如果开 LLM：会用你的输入生成更细致的文献查询关键词、攻击点、实验设计与解释。"
