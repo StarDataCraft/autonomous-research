@@ -1,174 +1,204 @@
 # cue_rules.py
-# ------------------------------------------------------------
-# Rule-based cue sentence classifier:
-# - Split cue-hit sentences into: claim vs limitation/failure
-# - limitation/failure = discourse_marker AND negative_semantics
-# - strong claim patterns override limitation candidates
-# ------------------------------------------------------------
-
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from functools import lru_cache
+from typing import Dict, List, Tuple
 
-CueKind = Literal["claim", "limitation/failure", "relevance-fallback"]
+import numpy as np
+
+# -----------------------------
+# Prototypes (Semantic)
+# -----------------------------
+# Claim prototypes (can be extended)
+_CLAIM_PROTOTYPES: List[str] = [
+    "We propose a new method.",
+    "We present a new approach.",
+    "We introduce a novel algorithm.",
+    "Our method achieves better performance.",
+    "This paper provides theoretical insights.",
+    "We show that our approach is effective.",
+    "The main contribution of this paper is to provide a new framework.",
+    "We demonstrate improved stability and efficiency.",
+    "In contrast, the approach proposed here gives batch size invariance without this assumption.",
+    "This approach provides improved robustness.",
+]
+
+# Limitation/failure prototypes (✅ expanded per your request)
+_LIMIT_PROTOTYPES: List[str] = [
+    "However, the method has limitations.",
+    "The approach is unstable in practice.",
+    "This remains challenging.",
+    "The problem remains underexplored.",
+    "Existing methods struggle in this regime.",
+    "There is a lack of theoretical understanding.",
+    "The results are far from state-of-the-art.",
+    "The approach is limited to simple distributions.",
+    "The method fails under certain distributions.",
+    "There is a trade-off between efficiency and fidelity.",
+
+    # ✅ your requested additions (exact)
+    "However, the theoretical understanding remains underexplored.",
+    "The theoretical understanding remains unclear.",
+    "This remains an open problem.",
+    "Existing analyses assume unrealistic conditions.",
+    "Results are still far from state-of-the-art.",
+    "The approach is limited to simple distributions.",
+]
+
+# Neutral/setup prototypes (✅ new)
+_NEUTRAL_PROTOTYPES: List[str] = [
+    "In this paper, we study rectified flow models.",
+    "In this paper, we study the problem setting.",
+    "We consider the setting where the data is generated from a distribution.",
+    "This paper focuses on analyzing the method.",
+    "We investigate the behavior of the algorithm.",
+    "We study the properties of the proposed model.",
+    "We describe the background and setup.",
+    "We outline the problem formulation.",
+]
+
+# -----------------------------
+# Negative evidence gate (lightweight safety rail)
+# Only applied when semantic classifier predicts limitation/failure.
+# -----------------------------
+_NEGATIVE_EVIDENCE_PATTERNS: List[str] = [
+    r"\blimit(?:ation|ations)?\b",
+    r"\bunderexplored\b",
+    r"\bunclear\b",
+    r"\bunknown\b",
+    r"\bopen problem\b",
+    r"\bchallenge(?:s)?\b",
+    r"\bdifficult(?:y)?\b",
+    r"\bhinder(?:ed|s)?\b",
+    r"\bfail(?:s|ed|ure)?\b",
+    r"\bunstable\b",
+    r"\bfar from\b.*\bstate[- ]of[- ]the[- ]art\b",
+    r"\bassume\b.*\bunrealistic\b",
+    r"\blimited to\b",
+    r"\black of\b",
+    r"\bdoes not\b",
+    r"\bcannot\b",
+    r"\bunable\b",
+    r"\byet\b.*\brequires\b",
+    r"\bremains\b.*\b(unclear|unknown|underexplored|challenging|difficult)\b",
+]
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _has_negative_evidence(s: str) -> bool:
+    s = _norm(s)
+    if not s:
+        return False
+    return any(re.search(pat, s) for pat in _NEGATIVE_EVIDENCE_PATTERNS)
+
+
+# -----------------------------
+# Embedding backend
+# -----------------------------
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(np.dot(a, b) / denom)
+
+
+@lru_cache(maxsize=4)
+def _load_encoder(model_name: str):
+    """
+    Cached SentenceTransformer.
+    Keep this module Streamlit-free; cache via lru_cache.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
+@lru_cache(maxsize=16)
+def _embed_texts(model_name: str, texts_tuple: Tuple[str, ...]) -> np.ndarray:
+    enc = _load_encoder(model_name)
+    # normalize embeddings improves cosine stability
+    embs = enc.encode(list(texts_tuple), normalize_embeddings=True, show_progress_bar=False)
+    return np.asarray(embs, dtype=np.float32)
+
+
+def _max_sim_to_prototypes(model_name: str, sentence: str, prototypes: List[str]) -> float:
+    sent = (sentence or "").strip()
+    if not sent:
+        return 0.0
+
+    sent_emb = _embed_texts(model_name, (sent,))[0]
+    prot_embs = _embed_texts(model_name, tuple(prototypes))
+
+    # since embeddings are normalized, cosine = dot
+    sims = prot_embs @ sent_emb
+    return float(np.max(sims)) if sims.size else 0.0
 
 
 @dataclass(frozen=True)
 class CueDecision:
-    kind: CueKind
-    reason: str
+    kind: str  # "claim" | "limitation/failure" | "relevance"
+    scores: Dict[str, float]  # {"claim":..., "limit":..., "neutral":...}
 
 
-# -----------------------------
-# Regex helpers
-# -----------------------------
-def _norm(s: str) -> str:
-    # normalize whitespace & lowercase
-    s = re.sub(r"\s+", " ", s.strip())
-    return s.lower()
-
-
-def _has_any(text: str, patterns: list[re.Pattern]) -> bool:
-    return any(p.search(text) for p in patterns)
-
-
-# -----------------------------
-# Discourse markers (ONLY candidate signals)
-# -----------------------------
-_DISCOURSE_MARKERS: list[re.Pattern] = [
-    re.compile(r"\bhowever\b", re.I),
-    re.compile(r"\bdespite\b", re.I),
-    re.compile(r"\bin contrast\b", re.I),
-    re.compile(r"\bbut\b", re.I),
-    re.compile(r"\bnevertheless\b", re.I),
-    re.compile(r"\bnonetheless\b", re.I),
-    re.compile(r"\byet\b", re.I),
-    re.compile(r"\bstill\b", re.I),
-    re.compile(r"\balthough\b", re.I),
-    re.compile(r"\bwhereas\b", re.I),
-]
-
-# -----------------------------
-# Negative semantics (required for limitation/failure)
-# Keep this list conservative; add items only if they reduce false positives.
-# -----------------------------
-_NEGATIVE_SEMANTICS: list[re.Pattern] = [
-    re.compile(r"\black(s|ing)?\b", re.I),
-    re.compile(r"\bund(er)?explored\b", re.I),
-    re.compile(r"\bhinder(ed|s|ing)?\b", re.I),
-    re.compile(r"\bf(ar)? from\b", re.I),  # "far from"
-    re.compile(r"\blimitation(s)?\b", re.I),
-    re.compile(r"\bchallenge(s)?\b", re.I),
-    re.compile(r"\bweak(ness|es)?\b", re.I),
-    re.compile(r"\bfail(ure|ures|ed|ing)?\b", re.I),
-    re.compile(r"\bcollapse(s|d)?\b", re.I),
-    re.compile(r"\bunstable\b", re.I),
-    re.compile(r"\binstabilit(y|ies)\b", re.I),
-    re.compile(r"\bproblem(s)?\b", re.I),
-    re.compile(r"\bdifficult(y|ies)\b", re.I),
-    re.compile(r"\binsufficient\b", re.I),
-    re.compile(r"\bnot (well )?understood\b", re.I),
-    re.compile(r"\bremains? (an )?open\b", re.I),
-    re.compile(r"\bstill (an )?open\b", re.I),
-    re.compile(r"\brare(ly)?\b", re.I),
-    re.compile(r"\bunderperform(s|ed|ing)?\b", re.I),
-    re.compile(r"\bdegrad(e|es|ed|ing)\b", re.I),
-    re.compile(r"\bpoor(ly)?\b", re.I),
-    re.compile(r"\bbias(ed)?\b", re.I),
-    re.compile(r"\bcomputational overhead\b", re.I),
-    re.compile(r"\bexpensive\b", re.I),
-    re.compile(r"\bslow\b", re.I),
-]
-
-# -----------------------------
-# Strong claim patterns (override limitation candidates)
-# - These indicate the sentence is likely a contribution/framing claim.
-# - IMPORTANT: include your "unified framework / can be viewed" case.
-# -----------------------------
-_STRONG_CLAIM: list[re.Pattern] = [
-    re.compile(r"\bwe (propose|present|introduce|develop|derive|prove|establish|show|demonstrate)\b", re.I),
-    re.compile(r"\bthis (paper|work|study) (proposes|presents|introduces|develops|derives|proves|establishes|shows|demonstrates)\b", re.I),
-    re.compile(r"\bwe (provide|offer) (a )?(theoretical|empirical|comprehensive)\b", re.I),
-    re.compile(r"\bwe confirm\b", re.I),
-    re.compile(r"\bwe argue\b", re.I),
-    re.compile(r"\bwe find\b", re.I),
-    re.compile(r"\bwe report\b", re.I),
-    # framing/unification claims:
-    re.compile(r"\bcan be viewed\b", re.I),
-    re.compile(r"\bunified framework\b", re.I),
-    re.compile(r"\bunder (a|the) unified framework\b", re.I),
-    re.compile(r"\brecast(ing)?\b", re.I),
-    re.compile(r"\bview(ed)? under\b", re.I),
-    re.compile(r"\bsubsume(s|d)?\b", re.I),
-]
-
-# -----------------------------
-# Positive-contribution verbs (guardrail to prevent misclassifying "reduces variance" etc.)
-# If a sentence matches these and does NOT strongly match negative semantics, treat as claim.
-# -----------------------------
-_POSITIVE_CONTRIB: list[re.Pattern] = [
-    re.compile(r"\breduce(s|d|ing)?\b", re.I),
-    re.compile(r"\bimprove(s|d|ing)?\b", re.I),
-    re.compile(r"\bachieve(s|d|ing)?\b", re.I),
-    re.compile(r"\boutperform(s|ed|ing)?\b", re.I),
-    re.compile(r"\bprovid(e|es|ed|ing) (guarantee|bounds|upper bound|lower bound|non-asymptotic)\b", re.I),
-    re.compile(r"\bprovably\b", re.I),
-    re.compile(r"\bdemonstrably\b", re.I),
-    re.compile(r"\bthe main contribution\b", re.I),
-]
-
-
-def classify_cue_sentence(sentence: str) -> CueDecision:
+def classify_cue_sentence(
+    sentence: str,
+    *,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    margin: float = 0.04,
+    min_limit: float = 0.28,
+    min_claim: float = 0.28,
+) -> CueDecision:
     """
-    Classify a sentence into:
-      - "limitation/failure": must satisfy (discourse_marker AND negative_semantics)
-                              OR strong negative semantics alone (rare but allowed).
-      - "claim": strong claim pattern, or positive contribution (without negatives),
-                 or otherwise non-negative.
-      - "relevance-fallback": only if it contains neither strong claim nor limitation signals.
+    Three-way semantic prototype classification:
+
+      - limitation/failure if limit_score is clearly the winner (by margin) and above min_limit
+      - claim if claim_score is clearly the winner (by margin) and above min_claim
+      - otherwise relevance
+
+    Then apply a lightweight negative-evidence gate ONLY for limitation:
+      if predicted limitation but no negative evidence, downgrade to relevance.
     """
+    sent = (sentence or "").strip()
+    if not sent:
+        return CueDecision(kind="relevance", scores={"claim": 0.0, "limit": 0.0, "neutral": 0.0})
 
-    raw = sentence.strip()
-    if not raw:
-        return CueDecision(kind="relevance-fallback", reason="empty")
+    claim_score = _max_sim_to_prototypes(model_name, sent, _CLAIM_PROTOTYPES)
+    limit_score = _max_sim_to_prototypes(model_name, sent, _LIMIT_PROTOTYPES)
+    neutral_score = _max_sim_to_prototypes(model_name, sent, _NEUTRAL_PROTOTYPES)
 
-    s = _norm(raw)
+    scores = {"claim": claim_score, "limit": limit_score, "neutral": neutral_score}
 
-    has_marker = _has_any(s, _DISCOURSE_MARKERS)
-    has_negative = _has_any(s, _NEGATIVE_SEMANTICS)
-    has_strong_claim = _has_any(s, _STRONG_CLAIM)
-    has_positive = _has_any(s, _POSITIVE_CONTRIB)
+    # decide winner with margin
+    best_label = max(scores.items(), key=lambda kv: kv[1])[0]
+    best = scores[best_label]
+    second = sorted(scores.values(), reverse=True)[1]
 
-    # 1) Strong claim overrides "marker-only" limitation candidates
-    #    Example: "Despite X, we propose Y" should be claim.
-    if has_strong_claim:
-        return CueDecision(kind="claim", reason="strong-claim-pattern")
+    kind = "relevance"
+    if best_label == "limit" and best >= (second + margin) and best >= min_limit:
+        kind = "limitation/failure"
+    elif best_label == "claim" and best >= (second + margin) and best >= min_claim:
+        kind = "claim"
+    else:
+        kind = "relevance"
 
-    # 2) If it's clearly a positive contribution and NOT negative -> claim
-    #    This prevents misclassifying e.g. "provably reduces gradient variance" as failure.
-    if has_positive and not has_negative:
-        return CueDecision(kind="claim", reason="positive-contribution-no-negative")
+    # negative-evidence gate (only for limitation)
+    if kind == "limitation/failure" and not _has_negative_evidence(sent):
+        kind = "relevance"
 
-    # 3) Limitation/failure requires BOTH marker and negative semantics
-    if has_marker and has_negative:
-        return CueDecision(kind="limitation/failure", reason="marker+negative")
-
-    # 4) Allow strong negative semantics even without marker (e.g., "remains underexplored")
-    #    This is common in abstracts.
-    if has_negative and not has_positive:
-        return CueDecision(kind="limitation/failure", reason="negative-without-positive")
-
-    # 5) Otherwise, treat as relevance fallback (or you can default to claim if you prefer)
-    return CueDecision(kind="relevance-fallback", reason="no-strong-signal")
+    return CueDecision(kind=kind, scores=scores)
 
 
-def is_limitation_failure(sentence: str) -> bool:
-    """Drop-in boolean helper if your old code expects a bool."""
-    return classify_cue_sentence(sentence).kind == "limitation/failure"
-
-
-def cue_label(sentence: str) -> str:
-    """UI label helper: returns 'claim' or 'limitation/failure' or 'relevance-fallback'."""
-    return classify_cue_sentence(sentence).kind
+def is_limitation_failure(
+    sentence: str,
+    *,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> bool:
+    """
+    Convenience boolean for synthesis filtering.
+    Uses semantic classifier + negative-evidence gate.
+    """
+    d = classify_cue_sentence(sentence, model_name=model_name)
+    return d.kind == "limitation/failure"
