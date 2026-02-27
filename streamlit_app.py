@@ -122,3 +122,7 @@ with col2:
 st.divider()
 st.subheader("Export")
 st.caption("你可以把输出复制到 Notion / Google Doc / issue tracker。后续我也可以帮你把它变成论文大纲。")
+
+st.write("use_llm:", use_llm)
+st.write("llm_available:", llm_available())
+st.write("has_key:", bool(st.secrets.get("OPENAI_API_KEY", None)))
