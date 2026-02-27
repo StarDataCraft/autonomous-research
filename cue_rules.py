@@ -504,21 +504,69 @@ def compute_novelty_rank(novelty: float, relevance: float, alpha: float = 2.0, f
 # -----------------------------
 # Backward-compatible API (for older streamlit_app.py)
 # -----------------------------
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-def classify_cue_sentence(sentence: str) -> str:
+@dataclass
+class CueDecision:
+    # streamlit_app.py expects .kind attribute
+    kind: str  # "claim" | "limitation/failure" | "other"
+    # optional helpful fields (won't break older code)
+    label: str = ""          # e.g. "claim" | "limitation" | "other"
+    confidence: float = 0.0
+    matched_cues: List[str] = None
+    debug: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.matched_cues is None:
+            self.matched_cues = []
+        if self.debug is None:
+            self.debug = {}
+
+def classify_cue_sentence(sentence: str, hinted_kind: str = "") -> CueDecision:
     """
     Backward-compatible wrapper.
-    Returns: "claim" | "limitation" | "other"
-    """
-    return classify_sentence(sentence)
 
+    Older streamlit_app.py calls:
+        d = classify_cue_sentence(sentence, hinted_kind?)
+    and then uses:
+        d.kind
+    where d.kind is expected to be "limitation/failure" for negative cues.
+    """
+    label = classify_sentence(sentence)  # your newer API: "claim" | "limitation" | "other"
+    if label == "limitation":
+        kind = "limitation/failure"
+    elif label == "claim":
+        kind = "claim"
+    else:
+        kind = "other"
 
-def is_limitation_failure(sentence: str) -> bool:
+    # If the UI passes a hint kind (from dataset cue tags), you can optionally prefer it.
+    # Keep conservative: only use it if it’s one of the known ones.
+    hk = (hinted_kind or "").strip().lower()
+    if hk in {"claim", "limitation/failure", "other"}:
+        # If hint conflicts with model label, keep model label (avoid making bad cues look "right")
+        # You can flip this rule if you want "cue preferred" to literally prefer the hint.
+        pass
+
+    return CueDecision(
+        kind=kind,
+        label=label,
+        confidence=1.0 if label != "other" else 0.5,
+        matched_cues=[],
+        debug={"hinted_kind": hinted_kind, "label": label, "kind": kind},
+    )
+
+def is_limitation_failure(x) -> bool:
     """
-    Backward-compatible wrapper.
-    True if the sentence is classified as limitation/failure.
+    Backward-compatible helper.
+    Accepts either a sentence (str) or a CueDecision.
     """
-    return classify_sentence(sentence) == "limitation"
+    if isinstance(x, CueDecision):
+        return x.kind == "limitation/failure"
+    if isinstance(x, str):
+        return classify_cue_sentence(x).kind == "limitation/failure"
+    return False
 
 # -----------------------------
 # Minimal self-test (optional)
