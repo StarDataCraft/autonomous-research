@@ -1,5 +1,5 @@
-import re
 import streamlit as st
+from cue_rules import classify_cue_sentence, is_limitation_failure
 
 from research_agent import (
     HypothesisSpec,
@@ -48,89 +48,25 @@ def _badge(text: str) -> str:
 
 # =========================================================
 # Cue classification (RULE-BASED)
-#   Goal:
-#     - Split "cue-hit" => Claim vs Limitation/Failure
-#     - Contradiction hunt should ONLY use Limitation/Failure
-#
-# NOTE:
-#   This UI layer does not require changing pipeline code.
-#   If upstream later emits kinds like "cue-claim" / "cue-limit",
-#   this function respects them directly.
+#   Uses cue_rules.py (two-stage: marker AND negative semantics)
+#   + strong claim override
 # =========================================================
-_LIMIT_PATTERNS = [
-    # discourse markers / hedges
-    r"\bhowever\b",
-    r"\bbut\b",
-    r"\bdespite\b",
-    r"\balthough\b",
-    r"\bnevertheless\b",
-    r"\byet\b",
-    r"\bwhereas\b",
-    r"\bwhile\b",
-    r"\bin contrast\b",
-    r"\bon the other hand\b",
-    # limitation words
-    r"\blimit(?:ation|ations)?\b",
-    r"\bunderexplored\b",
-    r"\bremain(?:s)? (?:unclear|unknown|underexplored|challenging)\b",
-    r"\bhinder(?:ed|s)?\b",
-    r"\bchallenge(?:s)?\b",
-    r"\bfailure(?:s)?\b",
-    r"\bfail(?:s|ed|ure)?\b",
-    r"\bcollapse(?:s|d)?\b",
-    r"\bfar from\b",
-    r"\black of\b",
-    r"\bdoes not\b",
-    r"\bcannot\b",
-    r"\bunable\b",
-    r"\bbias\b",
-    r"\bvariance\b.*\bhigh\b",
-    r"\bunstable\b",
-    r"\bmode(?:s)?\b.*\bdeplet(?:ion|ed)\b",
-    r"\btrade[- ]off\b",
-    r"\bconfound(?:er|ing)?\b",
-]
 
-_CLAIM_PATTERNS = [
-    r"\bwe propose\b",
-    r"\bwe present\b",
-    r"\bwe introduce\b",
-    r"\bwe develop\b",
-    r"\bwe derive\b",
-    r"\bwe show\b",
-    r"\bwe confirm\b",
-    r"\bwe establish\b",
-    r"\bwe prove\b",
-    r"\bwe demonstrate\b",
-    r"\bwe provide\b",
-    r"\bour main contribution\b",
-    r"\bthis paper (?:proposes|presents|introduces|develops)\b",
-]
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
-
-def _is_limitation_failure_sentence(sentence: str) -> bool:
-    s = _norm(sentence)
+def _strip_suffix_citation(s: str) -> str:
+    """
+    report.contradictions / headline points often look like:
+      "<sentence> — <paper title>"
+    We only want to classify the sentence part.
+    """
     if not s:
-        return False
-    # fast path: explicit limitation cues
-    for pat in _LIMIT_PATTERNS:
-        if re.search(pat, s):
-            return True
-    return False
-
-
-def _is_claim_sentence(sentence: str) -> bool:
-    s = _norm(sentence)
-    if not s:
-        return False
-    for pat in _CLAIM_PATTERNS:
-        if re.search(pat, s):
-            return True
-    return False
+        return ""
+    # prefer the exact delimiter used in your synthesis: " — "
+    if " — " in s:
+        return s.split(" — ", 1)[0].strip()
+    # fallback: hyphen variants
+    if " - " in s:
+        return s.split(" - ", 1)[0].strip()
+    return s.strip()
 
 
 def _classify_hit(kind: str, sentence: str) -> str:
@@ -142,30 +78,28 @@ def _classify_hit(kind: str, sentence: str) -> str:
       - fallback for unknown kinds
     """
     k = (kind or "").strip().lower()
+    sent = (sentence or "").strip()
 
     # If upstream already split them, respect it.
     if k in {"cue-limit", "cue-limitation", "cue-failure", "limitation", "failure"}:
         return "cue: limitation/failure"
     if k in {"cue-claim", "claim"}:
         return "cue: claim"
-
     if k == "relevance":
         return "relevance"
 
     # Backward-compat: old pipeline emits "cue-hit"
     if k == "cue-hit":
-        if _is_limitation_failure_sentence(sentence):
+        decision = classify_cue_sentence(sent)
+        if decision.kind == "limitation/failure":
             return "cue: limitation/failure"
-        # if it's clearly a claim, call it claim
-        if _is_claim_sentence(sentence):
+        if decision.kind == "claim":
             return "cue: claim"
-        # ambiguous => default to claim (safer than polluting contradictions)
-        return "cue: claim"
+        return "relevance"  # relevance-fallback
 
     # unknown -> leave as-is
     return k or "unknown"
-
-
+    
 def _render_key_sentences(hit_list, title="Key sentences"):
     """
     hit_list: list of objects with .kind and .sentence
