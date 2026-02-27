@@ -501,6 +501,24 @@ def compute_novelty_rank(novelty: float, relevance: float, alpha: float = 2.0, f
     n = max(0.0, min(1.0, novelty))
     return n * relevance_gate(relevance, alpha=alpha, floor=floor)
 
+# -----------------------------
+# Backward-compatible API (for older streamlit_app.py)
+# -----------------------------
+
+def classify_cue_sentence(sentence: str) -> str:
+    """
+    Backward-compatible wrapper.
+    Returns: "claim" | "limitation" | "other"
+    """
+    return classify_sentence(sentence)
+
+
+def is_limitation_failure(sentence: str) -> bool:
+    """
+    Backward-compatible wrapper.
+    True if the sentence is classified as limitation/failure.
+    """
+    return classify_sentence(sentence) == "limitation"
 
 # -----------------------------
 # Minimal self-test (optional)
