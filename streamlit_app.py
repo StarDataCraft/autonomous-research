@@ -18,10 +18,14 @@ st.caption(
 
 with st.sidebar:
     st.header("Mode")
-    use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=True)
+
+    # ✅ 推荐：如果 key 已可用，就默认开；否则默认关
+    use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=llm_available())
+
     st.markdown(
         "- 如果不开 LLM：用结构化模板生成高质量 research 计划（可直接用）。\n"
-        "- 如果开 LLM：会用你的输入生成更细致的文献查询关键词、攻击点、实验设计与解释。"
+        "- 如果开 LLM：会根据你的输入生成更细致的文献查询关键词、攻击点、实验设计与解释。\n"
+        "- 如果 LLM 调用失败，会显示 **LLM ERROR**（不再悄悄回退）。"
     )
 
     st.divider()
@@ -36,33 +40,37 @@ col1, col2 = st.columns([1, 1], gap="large")
 with col1:
     st.subheader("1) Hypothesis Spec（你来定义）")
 
-    default_h = (
-        "Flow Matching has lower gradient variance than DDPM when batch size ≤ 16."
-    )
+    default_h = "Flow Matching has lower gradient variance than DDPM when batch size ≤ 16."
     hypothesis = st.text_area("Hypothesis (falsifiable)", value=default_h, height=90)
 
     metric = st.text_area(
-        "Evaluation metrics (comma / newline separated)",
+        "Evaluation metrics (newline separated)",
         value="Gradient norm variance\nLoss variance\nFID after 10k steps",
         height=90,
     )
 
     controls = st.text_area(
-        "Control variables (what must be held constant)",
-        value="Same backbone (U-Net)\nSame dataset (CIFAR-10)\nSame optimizer (AdamW)\nSame learning rate\nSame training steps",
-        height=110,
+        "Control variables (newline separated)",
+        value=(
+            "Same backbone (U-Net)\n"
+            "Same dataset (CIFAR-10)\n"
+            "Same optimizer (AdamW)\n"
+            "Same learning rate\n"
+            "Same training steps"
+        ),
+        height=120,
     )
 
     failure = st.text_area(
         "Failure / reject condition (make it explicit)",
         value="Reject if variance difference < 5% OR Flow Matching FID is worse by > 3 points after 10k steps.",
-        height=80,
+        height=90,
     )
 
     constraints = st.text_area(
         "Constraints (compute, time, hardware, etc.)",
         value="Single GPU preferred; keep runtime under 2 hours for a first pass.",
-        height=70,
+        height=80,
     )
 
     spec = HypothesisSpec(
@@ -77,17 +85,19 @@ with col1:
     context = st.text_area(
         "Extra context (your project / domain / assumptions). Optional.",
         value="I care about small-batch stability and reproducibility. Prefer minimal, clean experiments.",
-        height=90,
+        height=110,
     )
 
 with col2:
     st.subheader("3) Run the pipeline")
 
+    # ✅ 如果你开了 use_llm 但 llm 不可用，给出提示（但不会崩）
     if use_llm and not llm_available():
         st.warning(
-            "LLM mode is ON but no OpenAI key found in st.secrets.\n"
-            "Add it in Streamlit Cloud → App settings → Secrets:\n"
-            "OPENAI_API_KEY=\"...\""
+            "LLM mode is ON but OpenAI is not available.\n"
+            "Please ensure:\n"
+            "- You have `openai` in requirements.txt\n"
+            "- You set OPENAI_API_KEY in Streamlit Cloud → App settings → Secrets\n"
         )
 
     run = st.button("Run autonomous research sprint", type="primary")
@@ -96,10 +106,13 @@ with col2:
         with st.status("Running pipeline...", expanded=True) as status:
             st.write("Step A — Literature Compression")
             lit = run_literature_compression(spec, context=context, use_llm=use_llm)
+
             st.write("Step B — Attack Phase (Reviewer mode)")
             attack = run_attack_phase(spec, context=context, use_llm=use_llm)
+
             st.write("Step C — Minimal Experiment Design")
             exp = design_minimal_experiment(spec, context=context, use_llm=use_llm)
+
             st.write("Step D — Conclusion Template (you write, not the agent)")
             concl = generate_conclusion_template(spec)
 
@@ -123,8 +136,8 @@ st.divider()
 st.subheader("Export")
 st.caption("你可以把输出复制到 Notion / Google Doc / issue tracker。后续我也可以帮你把它变成论文大纲。")
 
-st.write("use_llm:", use_llm)
-st.write("llm_available:", llm_available())
-st.write("has_key:", bool(st.secrets.get("OPENAI_API_KEY", None)))
-
-use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=False)
+# ✅ 可选：调试信息（你确认没问题后可以删掉）
+with st.expander("Debug (optional)", expanded=False):
+    st.write("use_llm:", use_llm)
+    st.write("llm_available:", llm_available())
+    st.write("has_key:", bool(st.secrets.get("OPENAI_API_KEY", None)))
