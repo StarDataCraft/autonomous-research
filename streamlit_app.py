@@ -126,3 +126,5 @@ st.caption("你可以把输出复制到 Notion / Google Doc / issue tracker。�
 st.write("use_llm:", use_llm)
 st.write("llm_available:", llm_available())
 st.write("has_key:", bool(st.secrets.get("OPENAI_API_KEY", None)))
+
+use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=False)
