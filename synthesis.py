@@ -1,231 +1,255 @@
 # synthesis.py
-# Uses PipelineResult from pipeline_abstract.py
-# Produces:
-# - Evidence map (by cluster) with sentence-level MMR headline points (de-dup + coverage)
-# - Bridge papers list
-# - Limitations/contradictions (only limitation/failure/comparison cues)
-# - Gaps (rules)
-# - New directions (rules) with axis-matched "Because" evidence
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-from collections import defaultdict, Counter
+from typing import Dict, List
+import math
 
-from pipeline_abstract import (
-    PipelineResult, Cluster, Paper,
-    novelty_leaderboards,
-    cluster_headline_points,
-    BREAKTHROUGH_AXES, CONFOUNDER_AXES
-)
+from pipeline_abstract import Paper, analyze_papers, split_sentences
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-
-def md_escape(s: str) -> str:
-    return s.replace("\n", " ").strip()
-
-
-def paper_line(p: Paper) -> str:
-    upd = f" · Updated: {p.updated}" if p.updated else ""
-    pdf = f" · PDF: {p.pdf_url}" if p.pdf_url else ""
-    return f"{p.title}{upd}{pdf}"
+def _fmt_float(x: float, nd: int = 3) -> str:
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "n/a"
 
 
-def key_sentences_block(p: Paper) -> str:
-    lines = []
-    if p.contradiction_sentences:
-        for s in p.contradiction_sentences[:3]:
-            lines.append(f"• (⚠️ cue-hit) {md_escape(s)}")
-    elif p.claim_sentences:
-        for s in p.claim_sentences[:3]:
-            lines.append(f"• {md_escape(s)}")
-    return "\n".join(lines) if lines else "• (no cue-hit sentence found in abstract)"
+def _paper_line(p: Dict) -> str:
+    pap = p["paper"]
+    title = pap["title"]
+    updated = pap.get("updated", "") or pap.get("updated", "")
+    pdf = pap.get("pdf_url", "") or pap.get("pdf", "")
+    if pdf:
+        return f"{title} · Updated: {updated} · PDF: {pdf}"
+    return f"{title} · Updated: {updated}"
 
 
-def axis_reasonable_for_breakthrough(axis: str) -> bool:
-    return axis in BREAKTHROUGH_AXES
+def _render_key_sentences(p: Dict) -> str:
+    hits = p.get("key_sentences", [])
+    if not hits:
+        return ""
+    # separate claim vs contra
+    claims = [h for h in hits if h.get("kind") == "claim"]
+    contras = [h for h in hits if h.get("kind") == "contra"]
+
+    out = []
+    if claims:
+        out.append("Key sentences (claims/highlights):")
+        for h in claims[:3]:
+            cue = " (⚠️ cue-hit)" if h.get("cue_hit") else ""
+            out.append(f"•{cue} {h.get('sentence','').strip()}")
+        out.append("")
+
+    if contras:
+        out.append("Contradiction/Limit/Fault hints (ONLY limitation/failure/comparison cues):")
+        for h in contras[:3]:
+            out.append(f"• (⚠️ contra-cue) {h.get('sentence','').strip()}")
+        out.append("")
+
+    return "\n".join(out).rstrip()
 
 
-def axis_reasonable_for_confounder(axis: str) -> bool:
-    return axis in CONFOUNDER_AXES
+def render_leaderboards(result: Dict) -> str:
+    lbs = result.get("leaderboards", {})
+    out = []
+    out.append("## Leaderboards\n")
+
+    def render_board(title: str, items: List[Dict], show_bridge: bool = False) -> None:
+        out.append(f"### {title}")
+        if not items:
+            out.append("(none)\n")
+            return
+        for i, p in enumerate(items[:10], 1):
+            pap = p["paper"]
+            ptype = p.get("paper_type", "other")
+            cid = p.get("cluster_id", -1)
+            rel = _fmt_float(p.get("relevance", 0.0))
+            nov = _fmt_float(p.get("novelty", 0.0))
+            novr = _fmt_float(p.get("novelty_rank", 0.0))
+            br = _fmt_float(p.get("bridge", 0.0))
+            brr = _fmt_float(p.get("bridge_rank", 0.0))
+            axis = p.get("axis", "n/a")
+            pdf = pap.get("pdf_url", "")
+
+            if show_bridge:
+                out.append(f"{i}. {pap['title']}\n{ptype} · axis={axis} · Cluster={cid} · Rel={rel} · Bridge={br} · BridgeRank={brr}")
+            else:
+                out.append(f"{i}. {pap['title']}\n{ptype} · axis={axis} · Cluster={cid} · Rel={rel} · Nov={nov} · NovRank={novr}")
+
+            meta_line = f"{pap.get('authors','')} · Updated: {pap.get('updated','')}"
+            if pdf:
+                meta_line += f" · PDF: {pdf}"
+            out.append(meta_line)
+
+            ks = _render_key_sentences(p)
+            if ks:
+                out.append("\n" + ks)
+            out.append("")
+
+    render_board("Novelty leaderboard (in-topic) — 突破/异端候选（已抑制离题离群）", lbs.get("novelty_in_topic", []))
+    render_board("Novelty leaderboard (confounders) — 训练/优化器离群点（单独榜）", lbs.get("novelty_confounder", []))
+    render_board("Bridge leaderboard — 跨簇连接点（统一视角候选）", lbs.get("bridge", []), show_bridge=True)
+
+    return "\n".join(out).strip()
 
 
-# -----------------------------
-# Synthesis core
-# -----------------------------
-
-def synthesize_key_points_and_directions(
-    result: PipelineResult,
-    top_per_cluster: int = 5,
-    top_bridge: int = 10,
-    top_limits: int = 12,
-) -> str:
+def render_synthesis(result: Dict) -> str:
     """
-    Produce a markdown synthesis from title+abstract only.
-    No LLM.
+    Produce:
+      A) Evidence map (by cluster) with MMR headline points
+      B) Bridge papers
+      C) Limitations/contradictions (contra-only)
+      D) Gaps
+      E) New directions (rules-based, axis-aligned)
     """
-    out: List[str] = []
-    out.append("## Synthesis: key points & new directions (No LLM)")
-    out.append("基于当前检索到的 papers（title+abstract），自动产出：证据地图、限制/争议、缺口、以及可执行的新研究方向。")
-    out.append("")
+    scored = result.get("scored_papers", [])
+    clusters = result.get("clusters", {})
+    meta = result.get("meta", {})
+
+    if not scored:
+        return "No papers to synthesize."
+
+    # group by cluster
+    by_cluster: Dict[int, List[Dict]] = {}
+    for p in scored:
+        cid = int(p.get("cluster_id", -1))
+        by_cluster.setdefault(cid, []).append(p)
+
+    # helper: pick top evidence papers per cluster by relevance_rank-like (relevance * sqrt(novelty+bridge))
+    def evidence_score(p: Dict) -> float:
+        rel = float(p.get("relevance", 0.0))
+        nov = float(p.get("novelty", 0.0))
+        br = float(p.get("bridge", 0.0))
+        return rel * (0.70 + 0.20 * math.sqrt(max(nov, 0.0)) + 0.10 * math.sqrt(max(br, 0.0)))
+
+    # Contra pool across all papers
+    contra_lines = []
+    for p in scored:
+        for h in p.get("key_sentences", []):
+            if h.get("kind") == "contra":
+                title = p["paper"]["title"]
+                contra_lines.append((float(h.get("score", 0.0)), f"• {h.get('sentence','').strip()} — {title}"))
+
+    contra_lines.sort(key=lambda x: x[0], reverse=True)
+
+    # Bridge list (top by bridge_rank)
+    bridge_sorted = sorted(scored, key=lambda x: float(x.get("bridge_rank", 0.0)), reverse=True)
+    bridge_titles = [p["paper"]["title"] for p in bridge_sorted[:12] if float(p.get("bridge_rank", 0.0)) > 0.0]
+
+    # Build synthesis text
+    out = []
+    out.append("## Synthesis: key points & new directions")
+    out.append(f"(No LLM) · embedder={meta.get('embedder','n/a')} · k_clusters={meta.get('k_clusters','n/a')}\n")
 
     # A) Evidence map
     out.append("### A) Evidence map (by cluster)")
-    for cl in result.clusters:
-        papers = [result.id2paper[pid] for pid in cl.paper_ids]
-        counts = Counter(p.paper_type for p in papers)
-        kw = ", ".join(cl.keywords[:10]) if cl.keywords else "(no keywords)"
+    for cid in sorted(by_cluster.keys()):
+        plist = by_cluster[cid]
+        info = clusters.get(cid, {})
+        keywords = info.get("keywords", [])
+        type_counts = info.get("type_counts", {})
 
-        out.append(f"**Cluster {cl.cid}** · size={len(papers)} · keywords: {kw} · (method/theory/empirical={dict(counts)})")
-        # Headline points: sentence-level MMR (de-dup + coverage)
-        points = cluster_headline_points(result, cl, max_points=top_per_cluster, lambda_rel=0.65)
-        if points:
-            out.append("")
-            out.append("Headline points (MMR-selected, de-duplicated):")
-            for sent, title in points:
-                out.append(f"- {md_escape(sent)} — *{md_escape(title)}*")
+        out.append(
+            f"\n**Cluster {cid}** · size={len(plist)} · keywords: {', '.join(keywords) if keywords else 'n/a'} "
+            f"(method/theory/empirical = {type_counts})"
+        )
+
+        # Headline points: use only CLAIMS (highlights) but MMR-like selection already done per paper.
+        # We now de-duplicate at cluster-level by picking top unique claim sentences from top papers.
+        # Strategy: pick top 2 papers by evidence_score, then take their claim sentences first, then fill.
+        top_papers = sorted(plist, key=evidence_score, reverse=True)[:6]
+
+        headline = []
+        seen = set()
+        for p in top_papers:
+            title = p["paper"]["title"]
+            for h in p.get("key_sentences", []):
+                if h.get("kind") != "claim":
+                    continue
+                s = h.get("sentence", "").strip()
+                key = s.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                headline.append(f"• {s} — {title}")
+                if len(headline) >= 5:
+                    break
+            if len(headline) >= 5:
+                break
+
+        if headline:
+            out.append("\nHeadline points (MMR-ish, de-duplicated):\n" + "\n".join(headline))
         else:
-            out.append("")
-            out.append("- (No headline points extracted.)")
+            out.append("\nHeadline points:\n(none extracted)")
 
-        # Top evidence papers: by relevance within cluster
-        top_p = sorted(papers, key=lambda p: p.relevance, reverse=True)[:min(5, len(papers))]
-        out.append("")
-        out.append("Top evidence papers:")
-        for p in top_p:
-            out.append(f"- {paper_line(p)}")
-        out.append("")
+        # Top evidence papers list
+        evid_titles = [p["paper"]["title"] for p in top_papers[:5]]
+        out.append("\nTop evidence papers:\n" + "\n".join([f"• {t}" for t in evid_titles]))
 
-    # B) Leaderboards (three novelty boards)
-    out.append("### B) Leaderboards")
-    lbs = novelty_leaderboards(result, topn=10)
-
-    out.append("#### B1) Novelty leaderboard — **In-topic breakthrough candidates**")
-    out.append("只在 `axis ∈ {objective/path, theory/bounds, evaluation/benchmark}` 内排序，避免“离题但离群”霸榜。")
-    if lbs["novelty_in_topic"]:
-        for i, p in enumerate(lbs["novelty_in_topic"], 1):
-            out.append(
-                f"{i}. **{p.title}**\n"
-                f"   - {p.paper_type} · axis={p.axis} · Rel={p.relevance:.3f} · Nov={p.novelty:.3f} · NovRank={p.novelty_rank:.3f}\n"
-                f"   - {paper_line(p)}\n\n"
-                f"{key_sentences_block(p)}\n"
-            )
+    # B) Bridge papers
+    out.append("\n### B) Bridge papers (cross-cluster connectors)")
+    if bridge_titles:
+        out.append("\n".join([f"• {t}" for t in bridge_titles[:12]]))
     else:
-        out.append("- (No in-topic novelty candidates found.)")
-    out.append("")
+        out.append("(none)")
 
-    out.append("#### B2) Novelty leaderboard — **Confounder novelty (optimizer/dynamics)**")
-    out.append("专门给 optimizer / training dynamics 的“离群点”，它们是混杂项/控制变量，不应该混进“突破榜”。")
-    if lbs["novelty_confounders"]:
-        for i, p in enumerate(lbs["novelty_confounders"], 1):
-            out.append(
-                f"{i}. **{p.title}**\n"
-                f"   - {p.paper_type} · axis={p.axis} · Rel={p.relevance:.3f} · Nov={p.novelty:.3f} · NovRank={p.novelty_rank:.3f}\n"
-                f"   - {paper_line(p)}\n\n"
-                f"{key_sentences_block(p)}\n"
-            )
+    # C) Limitations / contradictions
+    out.append("\n### C) Limitations / contradictions (contra-only)")
+    if contra_lines:
+        out.append("\n".join([x[1] for x in contra_lines[:12]]))
     else:
-        out.append("- (No confounder novelty papers found.)")
-    out.append("")
+        out.append("(none found in abstracts with contra-cues)")
 
-    out.append("#### B3) Bridge leaderboard — **Cross-cluster connectors**")
-    out.append("Bridge：同时接近多个簇中心（top2 centroid similarity 高，且 gap 小），并对 tutorial/survey 做惩罚。")
-    if lbs["bridge_leaderboard"]:
-        for i, p in enumerate(lbs["bridge_leaderboard"][:10], 1):
-            out.append(
-                f"{i}. **{p.title}**\n"
-                f"   - {p.paper_type} · axis={p.axis} · Rel={p.relevance:.3f} · Bridge={p.bridge:.3f} · BridgeRank={p.bridge_rank:.3f}\n"
-                f"   - {paper_line(p)}\n\n"
-                f"{key_sentences_block(p)}\n"
-            )
-    else:
-        out.append("- (No bridge papers found.)")
-    out.append("")
+    # D) Gaps (generic but *axis-aligned*)
+    out.append("\n### D) Gaps (what’s missing)")
+    out.append("• Define *exactly* how gradient variance is measured (global norm vs per-layer vs pre/post clipping) and keep it identical across methods.")
+    out.append("• Control knobs that erase small-batch differences: gradient clipping, EMA, LR warmup, time/noise sampling, solver choice.")
+    out.append("• Seed-robust comparisons (≥3 seeds) + uncertainty reporting (Std/CI); variance claims without uncertainty are weak.")
+    out.append("• Match compute budget (steps, NFE, wall-clock) before concluding ‘efficiency’ or ‘stability’.")
+    out.append("• Separate variance sources: target-variance (STF-like), estimator variance (TPC-like), optimizer/batch-noise (batch-invariant Adam).")
+    out.append("• Add a harder/shifted regime beyond CIFAR/MNIST (higher-res, corrupted data, different modality) to test generalization.")
 
-    # C) Limitations / contradictions (ONLY limitation/failure/comparison cues)
-    out.append("### C) Limitations / contradictions (cue-hit sentences)")
-    out.append("只采集 limitation/failure/comparison（不再把 “we propose/we show” 当成矛盾证据）。")
-    limit_pool: List[Tuple[float, str]] = []
-    for p in result.papers:
-        for s in p.contradiction_sentences:
-            # rank by relevance of the paper (simple but works)
-            limit_pool.append((p.relevance, f"• {md_escape(s)} — *{md_escape(p.title)}*"))
-    limit_pool.sort(key=lambda x: x[0], reverse=True)
-    if limit_pool:
-        for _, line in limit_pool[:top_limits]:
-            out.append(line)
-    else:
-        out.append("- (No limitation/failure/comparison cue-hit found in abstracts.)")
-    out.append("")
+    # E) New directions (rules-based, but cited by axis)
+    out.append("\n### E) New directions (rules-based proposals, axis-aligned)")
 
-    # D) Gaps (rules)
-    out.append("### D) Gaps (what’s missing)")
-    gaps = [
-        "定义并固定 gradient variance 的测量协议：global norm vs per-layer vs per-block；在 clipping 前/后；window size；统计量（var/trace/percentiles）。",
-        "显式控制会抹平 small-batch 差异的旋钮：gradient clipping、EMA、LR warmup、time/noise sampling、solver choice（Euler/RK）。",
-        "seed-robust：至少 3 seeds + 报告 mean±std/CI；否则“variance”结论不可信。",
-        "公平预算：matched NFE / steps / wall-clock；否则“效率优越”可能来自 baseline 不公平。",
-        "把 variance 分解成三类来源并分别做对照：target-variance（score/target）、estimator-variance（timestep coupling）、optimizer/batch-noise（micro-batch/Adam）。",
-        "Beyond CIFAR/MNIST：加入更难或分布偏移/腐蚀数据（corrupted data stress）检验是否能泛化。"
-    ]
-    for g in gaps:
-        out.append(f"- {g}")
-    out.append("")
+    # Build axis index
+    axis_to_titles: Dict[str, List[str]] = {}
+    for p in scored:
+        ax = p.get("axis", "applications")
+        axis_to_titles.setdefault(ax, []).append(p["paper"]["title"])
 
-    # E) New directions (rules-based) with axis-matched evidence
-    out.append("### E) New directions (rules-based proposals)")
-    out.append("下面每条都给出 *axis 匹配* 的 Because（避免把“统一框架论文”硬塞进 variance-bias 论证）。")
+    def because(axis: str, k: int = 3) -> str:
+        titles = axis_to_titles.get(axis, [])[:k]
+        if not titles:
+            return "Because: (no axis-matched papers found)"
+        return "Because: " + "; ".join(titles)
 
-    # Build axis -> papers sorted by relevance
-    axis2papers: Dict[str, List[Paper]] = defaultdict(list)
-    for p in result.papers:
-        axis2papers[p.axis].append(p)
-    for ax in axis2papers:
-        axis2papers[ax].sort(key=lambda p: p.relevance, reverse=True)
+    out.append("• Build a **variance taxonomy + measurement protocol**: decompose variance into (i) target variance, (ii) estimator variance, (iii) optimizer/batch-noise; report all under one logging definition and one backbone.")
+    out.append("  " + because("objective/path"))
 
-    def because(ax: str, k: int = 3) -> str:
-        ps = axis2papers.get(ax, [])[:k]
-        if not ps:
-            return "(no axis-matched evidence found)"
-        return "; ".join(p.title for p in ps)
+    out.append("• Run a **bridge-unification experiment**: under a single ‘generator matching / time-dependent reweighting’ lens, place diffusion / FM / rectified flow in one loss family and attribute variance reduction to (path distribution vs time sampling vs loss form).")
+    out.append("  " + because("objective/path"))
 
-    proposals = [
-        (
-            "建立一个 **variance taxonomy + measurement protocol**：把 variance 分解为 target-variance、estimator-variance、optimizer/batch-noise 三类，并在同一 backbone + 同一日志定义下系统对照。",
-            f"Because (axis-matched): optimizer/dynamics → {because('optimizer/dynamics')}; objective/path → {because('objective/path')}; theory/bounds → {because('theory/bounds')}"
-        ),
-        (
-            "做一个 **桥梁型统一视角实验**：以 Generator Matching / time-dependent reweighting 为统一框架，把 FM / diffusion / rectified flow 放在同一损失家族里，定位 variance 降低来自：路径分布 vs 时间采样 vs loss 形式。",
-            f"Because (axis-matched): objective/path → {because('objective/path')}"
-        ),
-        (
-            "研究 **variance–bias trade-off 的可控旋钮**：STF 类用 reference batch 降 variance 引入 bias；TPC 类降 estimator variance；提出统一的 bias budget 指标，把不同方法放进同一 Pareto frontier。",
-            f"Because (axis-matched): objective/path → {because('objective/path')}; evaluation/benchmark → {because('evaluation/benchmark')}"
-        ),
-        (
-            "针对 small-batch：把 **batch-size invariant optimizer** 作为控制变量，测试 FM vs diffusion 的差异是否仍存在；若差异消失，说明差异主要来自 optimizer/batch-noise 而非范式本身。",
-            f"Because (axis-matched): optimizer/dynamics → {because('optimizer/dynamics')}"
-        ),
-        (
-            "把 **failure modes 作为主任务**：定义可复现 failure suite（loss spikes/divergence/mode depletion/corrupted-data stress），比较不同 variance-reduction 在 failure suite 上的鲁棒性。",
-            f"Because (axis-matched): evaluation/benchmark → {because('evaluation/benchmark')}"
-        ),
-    ]
+    out.append("• Test **optimizer confounder hypothesis** in your exact small-batch regime: include batch-size-invariant optimizer as a control; if FM vs DDPM gap shrinks, the effect is mostly optimizer/batch-noise, not paradigm.")
+    out.append("  " + because("optimizer/dynamics"))
 
-    for ptxt, btxt in proposals:
-        out.append(f"- **{ptxt}**\n  - {btxt}")
+    out.append("• Create a **failure-suite benchmark** (loss spikes, divergence, mode depletion, corrupted-data stress), then compare variance-reduction knobs across the suite, not just average FID.")
+    out.append("  " + because("evaluation/benchmark"))
 
-    out.append("")
-    out.append("### F) Selected papers (MMR diversified list)")
-    if result.selected_ids:
-        for pid in result.selected_ids:
-            p = result.id2paper[pid]
-            out.append(f"- {paper_line(p)}")
-    else:
-        out.append("- (No selected papers.)")
+    return "\n".join(out).strip()
 
-    return "\n".join(out)
+
+def run_full_synthesis_no_llm(
+    papers: List[Paper],
+    query_text: str,
+    k_clusters: int = 4,
+) -> Dict[str, str]:
+    """
+    Convenience wrapper: returns markdown strings for UI.
+    """
+    result = analyze_papers(papers=papers, query_text=query_text, k_clusters=k_clusters)
+    return {
+        "leaderboards_md": render_leaderboards(result),
+        "synthesis_md": render_synthesis(result),
+        "meta": str(result.get("meta", {})),
+    }
