@@ -10,7 +10,7 @@ from research_agent import (
 )
 
 from pipeline_abstract import run_abstract_pipeline
-from synthesis import synthesize_from_clusters
+from synthesis import run_full_synthesis_no_llm
 
 
 st.set_page_config(page_title="Autonomous Research Engine", layout="wide")
@@ -378,3 +378,31 @@ with tab_pipeline:
             st.markdown(exp)
         with t4:
             st.markdown(concl)
+
+# --- Backward-compatible API for existing streamlit_app.py ---
+# Your app expects: from synthesis import synthesize_from_clusters
+# We provide it as a thin wrapper over the new pipeline.
+
+from typing import Any, Dict, List, Tuple
+
+def synthesize_from_clusters(
+    clusters: Dict[int, Dict[str, Any]],
+    scored_papers: List[Dict[str, Any]],
+    query_text: str = "",
+) -> str:
+    """
+    Backward compatible wrapper.
+    Expected legacy inputs:
+      - clusters: cluster metadata dict
+      - scored_papers: list of scored paper dicts
+    Returns:
+      - markdown string synthesis
+    """
+    # Build a fake "result" object compatible with render_synthesis/render_leaderboards
+    result = {
+        "clusters": clusters or {},
+        "scored_papers": scored_papers or [],
+        "leaderboards": {},  # optional; legacy path may not need it
+        "meta": {"embedder": "unknown", "k_clusters": len(clusters or {})},
+    }
+    return render_synthesis(result)
