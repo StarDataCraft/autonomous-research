@@ -1,4 +1,5 @@
 import streamlit as st
+
 from research_agent import (
     HypothesisSpec,
     run_literature_compression,
@@ -8,37 +9,30 @@ from research_agent import (
     llm_available,
 )
 
-st.set_page_config(page_title="Autonomous Research Mini-Pipeline", layout="wide")
+from pipeline_abstract import run_abstract_pipeline
 
+
+st.set_page_config(page_title="Autonomous Research Mini-Pipeline", layout="wide")
 st.title("Autonomous Research Mini-Pipeline")
-st.caption(
-    "20分钟结构化研究助手：Hypothesis → Literature Compression → Attack → Minimal Experiment → Conclusion.\n"
-    "可选接入 LLM（OpenAI），否则使用规则模板输出。"
-)
+st.caption("LLM 可选；本页新增：arXiv 搜索 + 轻量 embedding 阅读（Abstract-only，免费/低成本）。")
 
 with st.sidebar:
     st.header("Mode")
-
-    # ✅ 推荐：如果 key 已可用，就默认开；否则默认关
     use_llm = st.toggle("Use LLM (OpenAI via st.secrets)", value=llm_available())
-
-    st.markdown(
-        "- 如果不开 LLM：用结构化模板生成高质量 research 计划（可直接用）。\n"
-        "- 如果开 LLM：会根据你的输入生成更细致的文献查询关键词、攻击点、实验设计与解释。\n"
-        "- 如果 LLM 调用失败，会显示 **LLM ERROR**（不再悄悄回退）。"
-    )
 
     st.divider()
     st.header("Timebox")
     minutes = st.slider("Sprint length (minutes)", 10, 60, 20, step=5)
     st.write(f"当前：{minutes} 分钟 sprint")
 
-st.divider()
+tabA, tabB = st.tabs(["Pipeline (Template/LLM optional)", "Search & Read Abstracts (No LLM)"])
 
-col1, col2 = st.columns([1, 1], gap="large")
 
-with col1:
-    st.subheader("1) Hypothesis Spec（你来定义）")
+# =========================
+# Tab A: your original pipeline
+# =========================
+with tabA:
+    st.subheader("Hypothesis Spec")
 
     default_h = "Flow Matching has lower gradient variance than DDPM when batch size ≤ 16."
     hypothesis = st.text_area("Hypothesis (falsifiable)", value=default_h, height=90)
@@ -81,63 +75,113 @@ with col1:
         constraints=constraints.strip(),
     )
 
-    st.subheader("2) Optional: Context")
     context = st.text_area(
-        "Extra context (your project / domain / assumptions). Optional.",
+        "Extra context (optional)",
         value="I care about small-batch stability and reproducibility. Prefer minimal, clean experiments.",
-        height=110,
+        height=100,
     )
 
-with col2:
-    st.subheader("3) Run the pipeline")
-
-    # ✅ 如果你开了 use_llm 但 llm 不可用，给出提示（但不会崩）
     if use_llm and not llm_available():
-        st.warning(
-            "LLM mode is ON but OpenAI is not available.\n"
-            "Please ensure:\n"
-            "- You have `openai` in requirements.txt\n"
-            "- You set OPENAI_API_KEY in Streamlit Cloud → App settings → Secrets\n"
-        )
+        st.warning("LLM is ON but not available (missing key or openai package). Will fall back to template.")
 
-    run = st.button("Run autonomous research sprint", type="primary")
+    run = st.button("Run pipeline", type="primary")
 
     if run:
         with st.status("Running pipeline...", expanded=True) as status:
-            st.write("Step A — Literature Compression")
             lit = run_literature_compression(spec, context=context, use_llm=use_llm)
-
-            st.write("Step B — Attack Phase (Reviewer mode)")
             attack = run_attack_phase(spec, context=context, use_llm=use_llm)
-
-            st.write("Step C — Minimal Experiment Design")
             exp = design_minimal_experiment(spec, context=context, use_llm=use_llm)
-
-            st.write("Step D — Conclusion Template (you write, not the agent)")
             concl = generate_conclusion_template(spec)
 
             status.update(label="Done", state="complete", expanded=False)
 
-        st.success("Pipeline output generated.")
-
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Literature Compression", "Attack Phase", "Experiment Plan", "Conclusion Template"]
-        )
-        with tab1:
+        t1, t2, t3, t4 = st.tabs(["Literature", "Attack", "Experiment", "Conclusion Template"])
+        with t1:
             st.markdown(lit)
-        with tab2:
+        with t2:
             st.markdown(attack)
-        with tab3:
+        with t3:
             st.markdown(exp)
-        with tab4:
+        with t4:
             st.markdown(concl)
 
-st.divider()
-st.subheader("Export")
-st.caption("你可以把输出复制到 Notion / Google Doc / issue tracker。后续我也可以帮你把它变成论文大纲。")
 
-# ✅ 可选：调试信息（你确认没问题后可以删掉）
-with st.expander("Debug (optional)", expanded=False):
-    st.write("use_llm:", use_llm)
-    st.write("llm_available:", llm_available())
-    st.write("has_key:", bool(st.secrets.get("OPENAI_API_KEY", None)))
+# =========================
+# Tab B: No-LLM abstract engine
+# =========================
+with tabB:
+    st.subheader("arXiv Search + Embedding Read (Abstract-only)")
+    st.caption("完全不调用大模型：用免费 arXiv 搜索 + 小 embedding 模型做重排、去冗余、多样化与聚类。")
+
+    q = st.text_area(
+        "Research question / hypothesis",
+        value="Flow matching vs diffusion: small-batch stability and gradient variance",
+        height=90,
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        category = st.selectbox("arXiv category filter", ["cs.LG", "cs.CV", "cs.AI", "stat.ML", "none"], index=0)
+        category_filter = None if category == "none" else category
+    with col2:
+        max_per_q = st.slider("Max results per query", 10, 100, 50, step=10)
+    with col3:
+        mmr_k = st.slider("MMR select K", 8, 60, 24, step=4)
+
+    col4, col5 = st.columns(2)
+    with col4:
+        mmr_lambda = st.slider("MMR λ (relevance vs diversity)", 0.1, 0.9, 0.7, step=0.1)
+    with col5:
+        embed_model = st.selectbox(
+            "Embedding model",
+            [
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "BAAI/bge-small-en-v1.5",
+            ],
+            index=0,
+        )
+
+    go = st.button("Search & organize", type="primary")
+
+    if go:
+        with st.status("Searching and organizing...", expanded=True) as status:
+            selected, clusters, diag = run_abstract_pipeline(
+                hypothesis=q.strip(),
+                max_results_per_query=max_per_q,
+                mmr_k=mmr_k,
+                mmr_lambda=mmr_lambda,
+                category_filter=category_filter,
+                embed_model=embed_model,
+            )
+            status.update(label="Done", state="complete", expanded=False)
+
+        st.success(
+            f"Candidates: {diag['candidate_count']} → Selected: {diag['selected_count']} → Clusters: {diag['cluster_count']}"
+        )
+
+        with st.expander("Diagnostics (queries used)"):
+            st.write(diag["queries"])
+
+        st.markdown("## Cluster map (what to read)")
+        for c in clusters:
+            st.markdown(f"### Cluster {c.cluster_id}  ·  size={len(c.papers)}  ·  keywords: `{', '.join(c.keywords)}`")
+            rep = c.centroid_paper
+            st.markdown(f"**Representative:** [{rep.title}]({rep.entry_url})  \n"
+                        f"*{', '.join(rep.authors[:6])}*  \n"
+                        f"Updated: {rep.updated}  ·  Category: {rep.primary_category or 'n/a'}")
+
+            st.markdown("**Top papers in this cluster:**")
+            for p in c.papers[:6]:
+                st.markdown(f"- [{p.title}]({p.entry_url})  \n"
+                            f"  *{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}")
+
+            st.markdown("**Abstract (rep):**")
+            st.write(rep.summary)
+            st.divider()
+
+        st.markdown("## Selected papers (MMR diversified list)")
+        for i, p in enumerate(selected, start=1):
+            st.markdown(
+                f"{i}. [{p.title}]({p.entry_url})  \n"
+                f"   *{', '.join(p.authors[:6])}*  ·  Updated: {p.updated}  ·  PDF: {p.pdf_url}"
+            )
