@@ -193,3 +193,83 @@ def run_abstract_pipeline(
 
 
 __all__ = ["Paper", "run_abstract_pipeline"]
+
+# =========================
+# Minimal abstract search entrypoint
+# =========================
+
+import requests
+from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
+
+_ARXIV_API = "http://export.arxiv.org/api/query"
+_ARXIV_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+
+def run_abstract_pipeline(
+    query: str,
+    max_results: int = 50,
+    sort_by: str = "relevance",
+    sort_order: str = "descending",
+) -> List[Dict]:
+    """
+    This function MUST exist.
+    Streamlit imports it.
+
+    Returns:
+        List[dict] with keys:
+        paper_id, title, abstract, updated, pdf_url, authors, url
+    """
+
+    if not query.strip():
+        return []
+
+    q = quote_plus(query)
+    url = (
+        f"{_ARXIV_API}"
+        f"?search_query=all:{q}"
+        f"&start=0"
+        f"&max_results={max_results}"
+        f"&sortBy={sort_by}"
+        f"&sortOrder={sort_order}"
+    )
+
+    headers = {"User-Agent": "autonomous-research/0.1"}
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+
+    papers = []
+
+    for entry in root.findall("atom:entry", _ARXIV_NS):
+
+        title = entry.findtext("atom:title", default="", namespaces=_ARXIV_NS).strip()
+        abstract = entry.findtext("atom:summary", default="", namespaces=_ARXIV_NS).strip()
+        entry_id = entry.findtext("atom:id", default="", namespaces=_ARXIV_NS).strip()
+        updated = entry.findtext("atom:updated", default="", namespaces=_ARXIV_NS).strip()
+
+        # authors
+        authors = []
+        for a in entry.findall("atom:author", _ARXIV_NS):
+            name = a.findtext("atom:name", default="", namespaces=_ARXIV_NS)
+            if name:
+                authors.append(name)
+        authors_str = ", ".join(authors)
+
+        paper_id = entry_id.rsplit("/", 1)[-1] if entry_id else ""
+
+        pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf" if paper_id else ""
+
+        if title and abstract:
+            papers.append({
+                "paper_id": paper_id,
+                "title": title,
+                "abstract": abstract,
+                "updated": updated,
+                "pdf_url": pdf_url,
+                "authors": authors_str,
+                "url": entry_id,
+            })
+
+    return papers
