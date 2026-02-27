@@ -632,3 +632,82 @@ def cluster_headline_points(
         if len(out) >= max_points:
             break
     return out
+
+# -----------------------------
+# Backward-compatible wrapper
+# -----------------------------
+
+def run_abstract_pipeline(
+    query: str,
+    papers_payload,
+    k_clusters: int | None = None,
+    seed: int = 13,
+):
+    """
+    Backward-compatible entrypoint for older streamlit_app.py.
+
+    Parameters
+    ----------
+    query : str
+    papers_payload : list[dict] OR list[Paper]
+        Each dict should contain at least: title, abstract
+        Optional: id/pid, updated, pdf_url, category, authors
+    k_clusters : int | None
+    seed : int
+
+    Returns
+    -------
+    dict with:
+      - result: PipelineResult
+      - papers: List[Paper]
+      - clusters: List[Cluster]
+      - selected_ids: List[str]
+      - leaderboards: dict (novelty_in_topic / novelty_confounders / bridge_leaderboard)
+    """
+    # If caller already passed Paper objects
+    if papers_payload and hasattr(papers_payload[0], "title") and hasattr(papers_payload[0], "abstract"):
+        papers = papers_payload
+        # ensure pid exists
+        for i, p in enumerate(papers):
+            if not getattr(p, "pid", None):
+                p.pid = f"p{i+1}"
+    else:
+        # Convert list[dict] -> list[Paper]
+        papers = []
+        for i, d in enumerate(papers_payload or []):
+            title = (d.get("title") or "").strip()
+            abstract = (d.get("abstract") or "").strip()
+            if not title or not abstract:
+                # skip invalid entries
+                continue
+
+            pid = (d.get("pid") or d.get("id") or d.get("paper_id") or f"p{i+1}")
+            authors = d.get("authors") or []
+            if isinstance(authors, str):
+                # sometimes "A, B, C"
+                authors = [a.strip() for a in authors.split(",") if a.strip()]
+
+            papers.append(
+                Paper(
+                    pid=str(pid),
+                    title=title,
+                    abstract=abstract,
+                    updated=str(d.get("updated") or d.get("updated_at") or d.get("published") or ""),
+                    pdf_url=str(d.get("pdf_url") or d.get("pdf") or d.get("url") or ""),
+                    category=str(d.get("category") or ""),
+                    authors=authors if isinstance(authors, list) else [],
+                )
+            )
+
+    result = build_pipeline(query=query, papers=papers, k_clusters=k_clusters, seed=seed)
+
+    # leaderboards
+    lbs = novelty_leaderboards(result, topn=10)
+
+    return {
+        "result": result,
+        "papers": result.papers,
+        "clusters": result.clusters,
+        "selected_ids": result.selected_ids,
+        "leaderboards": lbs,
+    }
